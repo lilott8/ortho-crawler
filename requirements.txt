@@ -1,0 +1,4 @@
+aiohttp>=3.9
+asyncpg>=0.29
+aiosqlite>=0.19
+pyhocon>=0.3.60
