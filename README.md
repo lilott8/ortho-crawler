@@ -88,11 +88,14 @@ Set `database.backend` to `"postgres"` or `"sqlite"`.
 # Licensed Icon & Saints ingestion (Met / Wikimedia / ICONSAINT):
 ./.venv/bin/python main.py --config scraper.conf --mode icons
 
+# Saint roster from Wikipedia list articles (names only, no images/licensing):
+./.venv/bin/python main.py --config scraper.conf --mode saints
+
 # Daily follower-notification job (feast/nameday/veneration/new-icon):
 ./.venv/bin/python main.py --config scraper.conf --mode notify
 ```
 
-All three modes share the config file and the database, and each works with
+All modes share the config file and the database, and each works with
 `--loop` (e.g. `--mode notify --loop 24h`). See
 [Icon & Saints data layer](#icon--saints-data-layer).
 
@@ -292,11 +295,25 @@ least one source under `icons.sources`. Each source carries its
 `search_terms` / `max_files`, or `dataset_path` / `manifest`). The layer has its
 own `rate_limit` and `http` blocks (separate budget — different hosts).
 
+## Saint roster (`--mode saints`)
+
+A separate, much simpler job from the icon pipeline: it parses one or more
+Wikipedia **list articles** and upserts the linked saint names into the `saints`
+table. No images, no licensing gate — English Wikipedia text is CC BY-SA/GFDL as
+a blanket fact about the source, so there is nothing per-record to verify. A
+missing or renamed article is logged and skipped, never fatal.
+
+Configure it in the `saints { … }` block of [`scraper.conf`](scraper.conf):
+`enabled`, `wikipedia_articles` (article **titles**, not URLs — e.g.
+`"List of Eastern Orthodox saints"` for
+<https://en.wikipedia.org/wiki/List_of_Eastern_Orthodox_saints>), and
+`max_records`. Run with `--mode saints` (combinable with `--loop`).
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|notify`. |
+| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|saints\|notify`. |
 | [`config.py`](config.py) | HOCON loading + duration parsing into typed dataclasses. |
 | [`mediawiki.py`](mediawiki.py) | Async MediaWiki API client (category enumeration, content fetch). |
 | [`ratelimit.py`](ratelimit.py) | Token-bucket + concurrency limiter. |
@@ -308,4 +325,5 @@ own `rate_limit` and `http` blocks (separate budget — different hosts).
 | [`license_gate.py`](license_gate.py) | Per-record, fail-closed license verification gate. |
 | [`icon_sources.py`](icon_sources.py) | Met / Wikimedia / ICONSAINT source adapters. |
 | [`icon_pipeline.py`](icon_pipeline.py) | Icon ingestion: gate → normalize → store → emit events. |
+| [`saint_sources.py`](saint_sources.py) | Saint roster: parse Wikipedia list articles into saint names. |
 | [`notifications.py`](notifications.py) | Daily follower-notification job. |
