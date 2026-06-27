@@ -78,6 +78,8 @@ class SqliteStorage(Storage):
                 saint_cols = {row[1] for row in await cur.fetchall()}
             if saint_cols and "qid" not in saint_cols:
                 await self._conn.execute("ALTER TABLE saints ADD COLUMN qid TEXT")
+            if saint_cols and "description" not in saint_cols:
+                await self._conn.execute("ALTER TABLE saints ADD COLUMN description TEXT")
             # saint_claims gained `value` in its UNIQUE key. A pre-existing ledger
             # with the old 3-column key must be rebuilt — it's a derived ledger,
             # so re-ingest repopulates it.
@@ -339,10 +341,13 @@ class SqliteStorage(Storage):
 
     async def sync_recurring_events(self) -> int:
         async with self._lock:
+            # feast_day is a JSON array of MM-DD: expand to one event per date.
+            # json_valid guards any legacy scalar value (skipped, not fatal).
             c1 = await self._conn.execute(
                 """INSERT OR IGNORE INTO events (target_type, target_id, event_type, event_date)
-                   SELECT 'saint', id, 'feast_day', feast_day FROM saints
-                   WHERE feast_day IS NOT NULL""")
+                   SELECT 'saint', s.id, 'feast_day', je.value
+                   FROM saints s, json_each(s.feast_day) je
+                   WHERE s.feast_day IS NOT NULL AND json_valid(s.feast_day)""")
             c2 = await self._conn.execute(
                 """INSERT OR IGNORE INTO events (target_type, target_id, event_type, event_date)
                    SELECT 'icon', id, 'veneration_day', veneration_date FROM icons
@@ -418,6 +423,12 @@ class SqliteStorage(Storage):
             sid = cur.lastrowid
             await self._conn.commit()
             return sid
+
+    async def get_saint_id_by_qid(self, qid):
+        async with self._conn.execute(
+            "SELECT id FROM saints WHERE qid = ?", (qid,)) as cur:
+            row = await cur.fetchone()
+        return row["id"] if row else None
 
     async def _unique_covers_value(self, table: str) -> bool:
         """True if some UNIQUE index on ``table`` includes the ``value`` column."""
@@ -500,3 +511,9 @@ class SqliteStorage(Storage):
             """SELECT title, content, attribution FROM pages
                WHERE namespace = 0 AND removed_at IS NULL AND content IS NOT NULL""") as cur:
             return [_row_to_dict(r) for r in await cur.fetchall()]
+
+    async def needs_review_saints(self, limit):
+        async with self._conn.execute(
+            "SELECT canonical_name FROM saints WHERE qid IS NULL ORDER BY id LIMIT ?",
+            (limit,)) as cur:
+            return [r["canonical_name"] for r in await cur.fetchall()]

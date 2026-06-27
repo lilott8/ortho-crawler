@@ -73,8 +73,9 @@ CREATE TABLE IF NOT EXISTS saints (
     id              INTEGER  PRIMARY KEY AUTOINCREMENT,
     canonical_name  TEXT     NOT NULL UNIQUE,
     qid             TEXT,                                  -- Wikidata QID, identity anchor; NULL = needs-review
+    description     TEXT,                                  -- CC0 Wikidata one-liner (core data, no attribution)
     alt_names       TEXT,                                  -- JSON array, for search
-    feast_day       TEXT,                                  -- MM-DD, nullable
+    feast_day       TEXT,                                  -- JSON array of MM-DD (multi-valued), nullable
     bio_text        TEXT,
     bio_source_id   INTEGER  REFERENCES sources(id),
     bio_license     TEXT,                                  -- NULL = do not serve bio_text

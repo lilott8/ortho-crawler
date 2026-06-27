@@ -129,6 +129,11 @@ class Storage(abc.ABC):
         """Resolve a saint by canonical_name, creating it if needed; return its id."""
 
     @abc.abstractmethod
+    async def get_saint_id_by_qid(self, qid: str) -> Optional[int]:
+        """Existing saint id for this QID, or None — **never creates**. Image
+        producers link to already-seeded saints only (enrichment never seeds)."""
+
+    @abc.abstractmethod
     async def get_license_override(self, source_name: str,
                                    source_record_id: str) -> Optional[dict]:
         """Return a human override row for this record, or None.
@@ -243,14 +248,20 @@ class Storage(abc.ABC):
         """Active main-namespace crawled pages with content, as
         {title, content, attribution} — bio-claim candidates for enrichment."""
 
+    @abc.abstractmethod
+    async def needs_review_saints(self, limit: int) -> List[str]:
+        """Up to ``limit`` canonical names of needs-review saints (qid IS NULL),
+        for the `--mode review` worklist."""
 
-# Fact fields are uncopyrightable (a feast date or a short name can't be
-# license-encumbered), so they are servable without a cleared license.
-FACT_FIELDS = frozenset({"feast_day", "alt_names"})
+
+# Fact fields are core data with no licensing contract: a feast date, a short
+# name, or a CC0 Wikidata description can't be license-encumbered, so they are
+# servable without a cleared license. (Prose like `bio` is the opposite contract.)
+FACT_FIELDS = frozenset({"feast_day", "alt_names", "description"})
 
 # Fields whose reducer keeps the whole weight-ordered set (union) instead of one
 # winner. Their value column holds a JSON array.
-MULTI_VALUED_FIELDS = frozenset({"alt_names"})
+MULTI_VALUED_FIELDS = frozenset({"alt_names", "feast_day"})
 
 # How a field maps onto saints.* columns: field -> (value_col,
 # source_col_or_None, license_col_or_None). Multi-valued fields use value_col
@@ -259,7 +270,12 @@ _SAINT_FIELD_COLUMNS = {
     "bio": ("bio_text", "bio_source_id", "bio_license"),
     "feast_day": ("feast_day", None, None),
     "alt_names": ("alt_names", None, None),
+    "description": ("description", None, None),
 }
+
+# Weight for human corrections (the `curated` source). Far above any producer so
+# an explicit operator decision always wins the reducer.
+CURATED_WEIGHT = 1_000_000
 
 
 def reduce_claims(claims: Iterable[dict]) -> Dict[str, List[dict]]:

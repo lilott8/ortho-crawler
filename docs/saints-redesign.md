@@ -27,15 +27,30 @@ tooling), not the core mechanism.
   `union` (dedup, order-preserving → JSON). `FACT_FIELDS` (dates/names) servable
   without a license; everything else needs a cleared license.
 - **Wikipedia producer** — `fetch_saint_records`: QID + lead-extract bio
-  (CC BY-SA, attributed) + Wikidata aliases → `alt_names` (multi-valued) +
-  Wikidata feast day (`P841` → calendar-day item → MM-DD, cached) → `feast_day`
-  (a fact). Populating `saints.feast_day` lets the notify job's
-  `sync_recurring_events` finally materialize feast events.
+  (CC BY-SA, attributed) + Wikidata aliases → `alt_names` (multi-valued) + **all**
+  Wikidata feast days (`P841` → calendar-day items → MM-DD, cached) → `feast_day`
+  (multi-valued, a fact; JSON array; `sync_recurring_events` expands to one event
+  per date) + CC0 Wikidata **`description`** (single column, fact-class — served
+  without attribution; a *different licensing contract* than `bio`).
+- **Per-saint logging** — `run_saints` logs `[saints N] <name> | qid bio feast
+  alias desc` per record, plus phase + end-of-run summaries (`SaintRunStats`), so
+  a long crawl is observable in real time.
+- **Corrections + `--mode review`** — declarative `corrections { saint_qid, feast,
+  owiki_qid }` config (the needs-review workflow; version control = audit),
+  applied each run: `saint_qid` rescues a needs-review saint and unlocks its
+  Wikidata facts; `feast` enters the ledger via a `curated` source at
+  `CURATED_WEIGHT`; `owiki_qid` maps an enrichment page. `--mode review` emits
+  capped HOCON stubs for the pile (needs-review saints + unmatched OrthodoxWiki
+  pages).
 - **OrthodoxWiki enrichment** — reuses crawled `pages`; matches by name/alias
   then QID fallback; `clean_wikitext_lead`; CC BY-SA 2.5 bio at
   `orthodoxwiki_weight` (50). Never seeds.
 - **Image→saint linkage** — `icon_pipeline._resolve_saint` resolves a record's
-  label to a QID and links on a clean hit only; else image kept, link → review.
+  label to a QID and links **only to an already-seeded saint**
+  (`get_saint_id_by_qid`, never creates — enrichment never seeds); else the image
+  is kept and servable, link → review. Met/Commons adapters now emit a
+  conservative saint-name hint (`guess_saint_name`, "Saint/St./Holy <Name>") so
+  their icons can attach; a wrong guess simply fails to link.
 - **Licensing overrides** — per-type `license_policies` (config), most-specific
   wins, attribution mandatory; precedence: per-record DB → per-type → gate.
 - **Visibility** — `storage.coverage()` + `--mode stats` (saints with bio,
@@ -44,31 +59,23 @@ tooling), not the core mechanism.
   incl. `value`; SQLite ledger rebuild; Postgres constraint swap).
 
 ### Remaining
-- **Multi-feast / per-jurisdiction feast days.** `feast_day` is materialized as
-  a *single* MM-DD (first `P841` value). Saints with several feast traditions
-  lose the rest. The ledger + reducer already support multi-valued fields, so
-  the work is: add `feast_day` to `MULTI_VALUED_FIELDS`, change `saints.feast_day`
-  to a JSON array (or add `feast_days`), and teach `sync_recurring_events` to
-  emit an event per date. *Pick up here:* `saint_sources.fetch_wikidata_facts`
-  already breaks after the first `P841` — collect all, then thread the list
-  through `SaintRecord.feast_day` → `set_claims`.
-- **Feast coverage depends on which QID we resolved.** Wikidata completeness
-  varies across "same saint" entities (observed: `Q43216` has no `P841`, the
-  `wbsearchentities` hit `Q43706` does). This is the same QID-agreement issue as
-  the OrthodoxWiki fallback; a curated `qid → feast` override table is the
-  eventual backstop.
-- **Met/Commons stay image-only.** Their adapters still emit `saint_name=None`,
-  so their icons are valid but orphaned (no saint link). Converting them to emit
-  a saint signal (or a depicts/`P180`-based hint) is unimplemented.
-- **Saint `description` field** — not modeled on `saints`; only `bio` and
-  `feast_day` have materialized homes today.
-- **Needs-review workflow** — the pile is *counted* (`--mode stats`) but there's
-  no tooling to work it down (resolve a QID, merge, or reject); today it's the
-  per-type overrides + manual SQL.
-- **OrthodoxWiki QID-fallback recall** — safe but low (see the enrichment
-  section's caveat); a `title → QID` override table is the deferred fix.
-- **README** — the new modes/knobs are documented in `scraper.conf` and here,
-  but the README's saints/icons section is not yet updated.
+- **Icons are a separate first-class effort, deferred.** Saint↔icon *linking* and
+  the icons ingestion pipeline are intentionally on hold. When picked up:
+  - **Met/Commons linkage is heuristic / low-recall.** Adapters emit a saint-name
+    *hint* from the title (`guess_saint_name`) and link only to already-seeded
+    saints, so it's safe — but Met objects rarely carry a "Saint X" title and the
+    Commons hint is regex-based. Higher recall would use Commons structured-data
+    "depicts" (`P180`) → a QID directly (add `RawRecord.saint_qid`, link via
+    `get_saint_id_by_qid`, bypassing `wbsearchentities`). Met has no SDC, stays
+    title-only.
+- **Feast corrections are additive, not suppressive.** A `feast` correction adds
+  its date (sorted first via `CURATED_WEIGHT`) but does not *remove* a wrong
+  Wikidata feast — `feast_day` is a multi-valued union. Fine for the common
+  "Wikidata missing a feast" case; suppressing a wrong date would need a
+  per-field "authoritative source replaces" rule (not built).
+- **OrthodoxWiki QID-fallback recall** — safe but bounded (see the enrichment
+  section's caveat); `owiki_qid` corrections are the manual backstop for the
+  stubborn few.
 
 ### Deliberately not done (over-engineering avoided)
 - **Generic `Claim | Artifact` producer-sink rewrite of `icon_pipeline`** — the

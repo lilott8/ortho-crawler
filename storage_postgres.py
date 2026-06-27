@@ -202,6 +202,9 @@ class PostgresStorage(Storage):
             canonical_name, alt,
         )
 
+    async def get_saint_id_by_qid(self, qid):
+        return await self._pool.fetchval("SELECT id FROM saints WHERE qid = $1", qid)
+
     async def get_license_override(self, source_name, source_record_id):
         row = await self._pool.fetchrow(
             """SELECT decision, license, attribution, reviewer, reason
@@ -264,10 +267,14 @@ class PostgresStorage(Storage):
 
     async def sync_recurring_events(self) -> int:
         total = 0
+        # feast_day is a JSON array of MM-DD: expand to one event per date. The
+        # left('[') guard skips any legacy scalar value (not valid JSON).
         s1 = await self._pool.execute(
             """INSERT INTO events (target_type, target_id, event_type, event_date)
-               SELECT 'saint', id, 'feast_day', feast_day FROM saints
-               WHERE feast_day IS NOT NULL
+               SELECT 'saint', s.id, 'feast_day', je.value
+               FROM saints s,
+                    LATERAL json_array_elements_text(s.feast_day::json) je
+               WHERE s.feast_day IS NOT NULL AND left(s.feast_day, 1) = '['
                ON CONFLICT DO NOTHING""")
         s2 = await self._pool.execute(
             """INSERT INTO events (target_type, target_id, event_type, event_date)
@@ -399,3 +406,9 @@ class PostgresStorage(Storage):
             """SELECT title, content, attribution FROM pages
                WHERE namespace = 0 AND removed_at IS NULL AND content IS NOT NULL""")
         return [dict(r) for r in rows]
+
+    async def needs_review_saints(self, limit):
+        rows = await self._pool.fetch(
+            "SELECT canonical_name FROM saints WHERE qid IS NULL ORDER BY id LIMIT $1",
+            limit)
+        return [r["canonical_name"] for r in rows]

@@ -208,11 +208,13 @@ class IconPipeline:
             qid = await resolve_qid(name, self._http)
         except Exception as exc:  # noqa: BLE001 - a resolver hiccup must not kill ingest
             log.debug("QID resolve failed for %r: %s", name, exc)
-        if qid:
-            saint_id = await self._db.upsert_saint_by_qid(qid, name)
+        # Link to an *existing* (Wikipedia-seeded) saint only — image producers
+        # never seed saints. No QID, or a QID we haven't seeded -> needs-review
+        # (the image is still stored and servable; only the link waits).
+        saint_id = await self._db.get_saint_id_by_qid(qid) if qid else None
+        if saint_id is not None:
             self._stats.saints += 1
         else:
-            saint_id = None                       # image still stored; link -> review
             self._stats.unresolved += 1
         self._saint_cache[name] = saint_id
         return saint_id

@@ -97,6 +97,9 @@ Set `database.backend` to `"postgres"` or `"sqlite"`.
 
 # Read-only coverage report (saints with bios/feast days, needs-review, icons):
 ./.venv/bin/python main.py --config scraper.conf --mode stats
+
+# Read-only worklist: HOCON correction stubs for the needs-review pile:
+./.venv/bin/python main.py --config scraper.conf --mode review
 ```
 
 All modes share the config file and the database, and each works with
@@ -267,12 +270,18 @@ as unlicensed; a per-record human override is available (see below).
    re-flagged `pending_license_check` on the next `--mode icons` run.
 2. **Adapters** ([`icon_sources.py`](icon_sources.py)) pull raw records and
    surface only the license signal the gate needs; all HTTP is rate-limited.
-3. **The gate** classifies each record. A human row in `license_overrides`
-   (auditable, kept separate from automated decisions) wins over the gate.
-4. **Approved** icons get their image fetched into content-addressed storage
+3. **The gate** classifies each record. Precedence: a per-record
+   `license_overrides` row → a per-type `license_policies` rule → the automated
+   gate (all auditable, kept separate).
+4. **Saint linkage.** Adapters emit a best-effort saint hint (ICONSAINT labels;
+   a `guess_saint_name` from Met/Commons titles). The pipeline resolves it to a
+   Wikidata QID and links the icon **only to an already-seeded saint** (it never
+   creates saints); otherwise the image is still stored, with the link left for
+   review.
+5. **Approved** icons get their image fetched into content-addressed storage
    (`icons.download_dir`, deduped by sha1, with a `.json` attribution sidecar) —
    never hotlinked. The local path is stored in `icons.image_url`.
-5. When a new icon is approved for a saint that **already has followers**, the
+6. When a new icon is approved for a saint that **already has followers**, the
    pipeline writes a one-off `new_icon_added` event.
 
 ### Notifications
@@ -312,25 +321,51 @@ What a `--mode saints` run does:
 
 1. **Wikipedia (the content spine).** For each saint in the configured list
    articles, fetch its Wikidata QID, lead-extract **bio** (CC BY-SA, attributed),
-   Wikidata **aliases** (`alt_names`, multi-valued), and **feast day** (`P841` →
-   MM-DD). A name with no QID is kept as **needs-review** (`qid IS NULL`), never
-   wrongly merged.
+   Wikidata **aliases** (`alt_names`, multi-valued), **feast days** (`P841` →
+   MM-DD, multi-valued — a saint may have several feast traditions), and a CC0
+   Wikidata **description** (a core-data one-liner for list views). A name with no
+   QID is kept as **needs-review** (`qid IS NULL`), never wrongly merged.
 2. **OrthodoxWiki enrichment** (if `orthodoxwiki_weight > 0`). Reuses pages
    already crawled by `--mode wiki` — no extra crawl. Matches each page to an
    existing saint by name/alias, then by QID for misses, and contributes a
    lower-weight CC BY-SA 2.5 bio. It **only wins** a saint's bio slot when
    Wikipedia has none.
 
+The run is logged per saint — `[saints N] <name> | qid=… bio=… feast=… alias=…
+desc=…` — with phase summaries and an end-of-run banner, so a long crawl is
+observable in real time.
+
 Merge rules: **per-field reducers**, not a single overwrite. Scalar fields
 (`bio`) take the highest-weight *license-cleared* claim; multi-valued fields
-(`alt_names`) union all values in weight order. **Facts** (`feast_day`, names)
-are servable without a license; **prose** (`bio`) is withheld unless a license is
-captured — so `saints.bio_text` is served only when `saints.bio_license` is set.
+(`alt_names`, `feast_day`) union all values in weight order. **Facts** (`feast_day`,
+names, the CC0 `description`) are servable without a license; **prose** (`bio`) is
+withheld unless a license is captured — so `saints.bio_text` is served only when
+`saints.bio_license` is set. (Different fields carry different licensing
+contracts — that's by design.)
 
 Configure it in the `saints { … }` block of [`scraper.conf`](scraper.conf):
 `enabled`, `wikipedia_articles` (article **titles**, not URLs), `max_records`,
 and the source weights `wikipedia_weight` / `orthodoxwiki_weight`. Coarse,
 per-type licensing overrides live in the top-level `license_policies` list.
+
+### Corrections & review (`--mode review`)
+
+Automation can't resolve everything: some saints get no Wikidata QID from
+Wikipedia (needs-review), Wikidata sometimes lacks a feast day, and an
+OrthodoxWiki page title occasionally matches no saint. You patch the **high-value
+few** with a declarative `corrections { }` block in the config (version control is
+the audit trail), applied on every run:
+
+- **`saint_qid`** (`{ name, qid }`) — give a needs-review saint a QID; it's
+  rescued *and* its Wikidata facts load on the same run.
+- **`feast`** (`{ qid, days }`) — curate feast day(s), applied at top weight so
+  the curated date sorts first (added to, not replacing, any others).
+- **`owiki_qid`** (`{ title, qid }`) — map an OrthodoxWiki page straight to a QID.
+
+Run **`--mode review`** to get the worklist: it prints ready-to-edit HOCON
+correction stubs (`{ name = "…", qid = "" }`) for the needs-review pile and
+unmatched OrthodoxWiki pages, capped to keep you focused on the few that matter.
+Fill in the QIDs, paste into your `.conf`, re-run.
 
 ### Visibility (`--mode stats`)
 
@@ -343,7 +378,7 @@ answer to "what do we actually have, and where are the gaps."
 
 | File | Purpose |
 | --- | --- |
-| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|saints\|notify`. |
+| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|saints\|notify\|stats\|review`. |
 | [`config.py`](config.py) | HOCON loading + duration parsing into typed dataclasses. |
 | [`mediawiki.py`](mediawiki.py) | Async MediaWiki API client (category enumeration, content fetch). |
 | [`ratelimit.py`](ratelimit.py) | Token-bucket + concurrency limiter. |
@@ -355,5 +390,5 @@ answer to "what do we actually have, and where are the gaps."
 | [`license_gate.py`](license_gate.py) | Per-record, fail-closed license verification gate. |
 | [`icon_sources.py`](icon_sources.py) | Met / Wikimedia / ICONSAINT source adapters. |
 | [`icon_pipeline.py`](icon_pipeline.py) | Icon ingestion: gate → normalize → store → emit events. |
-| [`saint_sources.py`](saint_sources.py) | Saint roster: parse Wikipedia list articles into saint names. |
+| [`saint_sources.py`](saint_sources.py) | Saint producers: Wikipedia bio + Wikidata QID/aliases/feast/description; OrthodoxWiki wikitext lead; QID resolver. |
 | [`notifications.py`](notifications.py) | Daily follower-notification job. |

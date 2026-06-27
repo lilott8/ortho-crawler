@@ -14,7 +14,8 @@ import tempfile
 import json
 from types import SimpleNamespace
 
-from config import DatabaseConfig, LicensePolicy, SaintsConfig, select_policy
+from config import (Corrections, DatabaseConfig, LicensePolicy, SaintsConfig,
+                    select_policy)
 from icon_pipeline import IconPipeline, IconRunStats
 from icon_sources import RawRecord
 from saint_sources import (_parse_month_day, build_name_index,
@@ -77,7 +78,7 @@ async def test_storage():
     assert row["bio_text"].startswith("Archbishop"), row["bio_text"]
     assert row["bio_license"] == "CC-BY-SA-4.0", row["bio_license"]
     assert row["bio_source_id"] == wiki.source_id
-    assert row["feast_day"] == "11-13"          # fact, served without a license
+    assert json.loads(row["feast_day"]) == ["11-13"]   # fact, multi-valued JSON array
 
     # Withdraw the license on the winning bio -> slot clears (fail closed).
     await db.add_claim(sid, "bio", "Archbishop...", wiki.source_id, 100, None, None)
@@ -138,6 +139,9 @@ async def test_icon_saint_linkage():
         db = await SqliteStorage.connect(DatabaseConfig(backend="sqlite", path=tmp))
         await db.apply_schema()
         # Bypass __init__ (which needs a full Config) — wire only what we test.
+        # Icons link only to an already-seeded saint — create it first.
+        await db.upsert_source("wikipedia", "CC-BY-SA-4.0", None, False)
+        await db.upsert_saint_by_qid("Q43216", "John Chrysostom")
         pipe = IconPipeline.__new__(IconPipeline)
         pipe._db = db
         pipe._http = object()
@@ -195,6 +199,33 @@ def test_feast_day_parse():
     assert _parse_month_day("January 27") == "01-27"
     assert _parse_month_day("nonsense") is None
     assert _parse_month_day("") is None
+
+
+def test_guess_saint_name():
+    from icon_sources import guess_saint_name
+    assert guess_saint_name("File:Icon of Saint Nicholas.jpg") == "Saint Nicholas"
+    assert guess_saint_name("St. George and the Dragon") == "St. George"
+    assert guess_saint_name("Random landscape painting.jpg") is None
+    assert guess_saint_name(None) is None
+
+
+async def test_multi_feast_storage():
+    """feast_day is multi-valued: several dates materialize as a JSON array, and
+    sync_recurring_events expands them into one event per date."""
+    tmp = os.path.join(tempfile.mkdtemp(), "f.db")
+    db = await SqliteStorage.connect(DatabaseConfig(backend="sqlite", path=tmp))
+    await db.apply_schema()
+    src = await db.upsert_source("wikipedia", "CC-BY-SA-4.0", None, False)
+    sid = await db.upsert_saint_by_qid("Q1", "Twice-Feasted Saint")
+    await db.set_claims(sid, "feast_day", ["11-13", "01-27"], src.source_id, 100, None, None)
+    await db.recompute_saint(sid)
+    row = await _saint(db, sid)
+    assert json.loads(row["feast_day"]) == ["11-13", "01-27"], row["feast_day"]
+
+    assert await db.sync_recurring_events() == 2          # one event per date
+    assert len(await db.due_recurring_events("11-13")) == 1
+    assert len(await db.due_recurring_events("01-27")) == 1
+    await db.close()
 
 
 def test_wikitext_cleaner():
@@ -267,7 +298,8 @@ async def test_orthodoxwiki_qid_match():
 
         cfg = SimpleNamespace(
             scraper=SimpleNamespace(user_agent="t/0.1 (a@b.c)"),
-            saints=SaintsConfig(orthodoxwiki_weight=50))
+            saints=SaintsConfig(orthodoxwiki_weight=50),
+            corrections=Corrections())
         await main._enrich_from_orthodoxwiki(cfg, db)
 
         async with db._conn.execute(
@@ -280,6 +312,66 @@ async def test_orthodoxwiki_qid_match():
         main.resolve_qid = orig
 
 
+async def test_description_and_needs_review():
+    """description is a core-data fact (servable with no license); the
+    needs-review worklist query returns only qid-NULL saints."""
+    tmp = os.path.join(tempfile.mkdtemp(), "d.db")
+    db = await SqliteStorage.connect(DatabaseConfig(backend="sqlite", path=tmp))
+    await db.apply_schema()
+    src = await db.upsert_source("wikipedia", "CC-BY-SA-4.0", None, False)
+    sid = await db.upsert_saint_by_qid("Q1", "Saint One")
+    await db.add_claim(sid, "description", "A church father.", src.source_id,
+                       100, None, None)            # no license -> still served (fact)
+    await db.recompute_saint(sid)
+    row = await _saint(db, sid)
+    assert row["description"] == "A church father.", row["description"]
+
+    await db.upsert_saint("Unresolved One")        # qid stays NULL -> needs-review
+    names = await db.needs_review_saints(10)
+    assert "Unresolved One" in names and "Saint One" not in names, names
+    await db.close()
+
+
+async def test_curated_feast_correction():
+    """A curated feast correction is applied at CURATED_WEIGHT: its date sorts
+    first (authoritative), additively with any Wikipedia feast."""
+    from config import Corrections
+    from main import _apply_feast_corrections, SaintRunStats
+    tmp = os.path.join(tempfile.mkdtemp(), "cf.db")
+    db = await SqliteStorage.connect(DatabaseConfig(backend="sqlite", path=tmp))
+    await db.apply_schema()
+    wiki = await db.upsert_source("wikipedia", "CC-BY-SA-4.0", None, False)
+    curated = await db.upsert_source("curated", "curated", None, False)
+    sid = await db.upsert_saint_by_qid("Q1", "Saint One")
+    await db.set_claims(sid, "feast_day", ["05-05"], wiki.source_id, 100, None, None)
+
+    corr = Corrections(feast={"Q1": ["11-13"]})
+    await _apply_feast_corrections(db, corr, curated.source_id, SaintRunStats())
+    days = json.loads((await _saint(db, sid))["feast_day"])
+    assert days[0] == "11-13", days          # curated first (top weight)
+    assert "05-05" in days, days             # additive — Wikipedia date retained
+    await db.close()
+
+
+def test_corrections_config():
+    from config import load_config
+    conf = (
+        'scraper { api_url = "https://x/api.php", user_agent = "t (a@b.c)" }\n'
+        'database { backend = "sqlite", path = "x.db" }\n'
+        'corrections {\n'
+        '  saint_qid = [ { name = "Foo", qid = "Q1" } ]\n'
+        '  feast = [ { qid = "Q1", days = ["11-13", "01-27"] } ]\n'
+        '  owiki_qid = [ { title = "Bar", qid = "Q2" } ]\n'
+        '}\n')
+    p = os.path.join(tempfile.mkdtemp(), "c.conf")
+    with open(p, "w") as fh:
+        fh.write(conf)
+    c = load_config(p)
+    assert c.corrections.saint_qid == {"Foo": "Q1"}, c.corrections.saint_qid
+    assert c.corrections.feast == {"Q1": ["11-13", "01-27"]}, c.corrections.feast
+    assert c.corrections.owiki_qid == {"Bar": "Q2"}, c.corrections.owiki_qid
+
+
 async def _saint(db, sid):
     async with db._conn.execute("SELECT * FROM saints WHERE id = ?", (sid,)) as cur:
         return await cur.fetchone()
@@ -290,10 +382,15 @@ if __name__ == "__main__":
     test_multi_valued_reducer()
     test_policy_specificity()
     test_feast_day_parse()
+    test_guess_saint_name()
     test_wikitext_cleaner()
+    test_corrections_config()
     asyncio.run(test_storage())
     asyncio.run(test_coverage())
     asyncio.run(test_multi_valued_storage())
+    asyncio.run(test_multi_feast_storage())
+    asyncio.run(test_description_and_needs_review())
+    asyncio.run(test_curated_feast_correction())
     asyncio.run(test_orthodoxwiki_enrichment())
     asyncio.run(test_orthodoxwiki_qid_match())
     asyncio.run(test_icon_saint_linkage())

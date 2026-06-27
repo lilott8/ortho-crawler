@@ -269,6 +269,21 @@ def select_policy(policies, target_type: str, source: Optional[str],
 
 
 @dataclass
+class Corrections:
+    """Operator-curated corrections applied on each run (the needs-review
+    "workflow", version-controlled in config — the audit trail). For the
+    high-value few that automation can't resolve; `--mode review` lists candidates
+    as ready-to-edit stubs.
+    """
+    saint_qid: Dict[str, str] = field(default_factory=dict)        # display name -> QID
+    feast: Dict[str, List[str]] = field(default_factory=dict)      # QID -> [MM-DD]
+    owiki_qid: Dict[str, str] = field(default_factory=dict)        # OrthodoxWiki title -> QID
+
+    def __bool__(self) -> bool:
+        return bool(self.saint_qid or self.feast or self.owiki_qid)
+
+
+@dataclass
 class IconsConfig:
     """Configuration for the Icon & Saints ingestion pipeline + notifications.
 
@@ -335,6 +350,7 @@ class Config:
     icons: IconsConfig = field(default_factory=IconsConfig)
     saints: SaintsConfig = field(default_factory=SaintsConfig)
     license_policies: List[LicensePolicy] = field(default_factory=list)
+    corrections: Corrections = field(default_factory=Corrections)
 
 
 def _policy_from(node) -> MediaPolicy:
@@ -444,6 +460,23 @@ def _load_license_policies(conf) -> List[LicensePolicy]:
     return policies
 
 
+def _load_corrections(conf) -> Corrections:
+    node = conf.get("corrections", None)
+    if not node:
+        return Corrections()
+    saint_qid, feast, owiki_qid = {}, {}, {}
+    for item in node.get("saint_qid", []) or []:
+        if item.get("name") and item.get("qid"):
+            saint_qid[str(item["name"])] = str(item["qid"])
+    for item in node.get("feast", []) or []:
+        if item.get("qid") and item.get("days"):
+            feast[str(item["qid"])] = [str(d) for d in item["days"]]
+    for item in node.get("owiki_qid", []) or []:
+        if item.get("title") and item.get("qid"):
+            owiki_qid[str(item["title"])] = str(item["qid"])
+    return Corrections(saint_qid=saint_qid, feast=feast, owiki_qid=owiki_qid)
+
+
 def _load_saints(conf) -> SaintsConfig:
     node = conf.get("saints", None)
     if node is None:
@@ -503,4 +536,5 @@ def load_config(path: str) -> Config:
 
     return Config(scraper=scraper, database=database, icons=_load_icons(conf),
                   saints=_load_saints(conf),
-                  license_policies=_load_license_policies(conf))
+                  license_policies=_load_license_policies(conf),
+                  corrections=_load_corrections(conf))

@@ -71,36 +71,58 @@ Flat module layout; the crawl pipeline lives in `scraper.py`.
 - `scraper.py` — `Scraper.run()`: discover → mark_seen → crawl stale → reconcile
   deletions.
 
-### Icon & Saints data layer (second pipeline, `--mode icons` / `--mode notify`)
+### Icon & Saints data layer (modes: `saints` / `icons` / `notify` / `stats` / `review`)
 
-A licensing-first pipeline independent of the wiki scraper, in the same DB,
-**disabled by default** (`icons.enabled`). Powers a saints/icons consumer feature
-(search/save/follow + notifications). Modules:
+A licensing-first consumer data layer independent of the wiki scraper, in the
+same DB, **disabled by default** (`saints.enabled` / `icons.enabled`). Two
+related but distinct first-class entities — **saints** and **icons** — collected
+differently. Powers search/save/follow + notifications.
 
-- `license_gate.py` — per-record, **fail-closed** gate (`approved`/`quarantined`/
-  `rejected`). Pure/sync classifier; `icon_pipeline` applies `license_overrides`
-  (human decisions) around it.
-- `icon_sources.py` — `SourceAdapter`s for `met_api` (PD per-object), `wikimedia`
-  (per-file tag vs. allowlist), `iconsaint` (blanket CC BY, local dataset).
-  Adapters surface only the license signal; the gate decides. All HTTP is
-  rate-limited via the shared `RateLimiter`.
-- `icon_pipeline.py` — `IconPipeline.run()`: seed sources (re-flag approvals on
-  `base_license` change) → per record: override/gate → resolve saint →
-  **materialize image only if approved** (content-addressed like wiki media,
-  with sidecar) → `store_icon` → emit `new_icon_added` when a new icon is
-  approved for an already-followed saint.
-- `notifications.py` — daily job; recurring events match `MM-DD`, one-offs match
-  today; once-per-day-per-user dedup.
+**Saints = a multi-source claims ledger.** Saints are identified by **Wikidata
+QID** and built additively: each source writes *claims* to `saint_claims`, and a
+per-field reducer materializes the winners into `saints.*`. Modules:
 
-Invariants here: **only `crawl_status='approved'` is servable** (the app must
-filter on it); the gate fails closed; **images and text/bios are licensed
-independently** (`saints.bio_text` withheld while `bio_license` IS NULL); dates
-are **UTC** end-to-end (`new_icon_added` event_date, the notify job's "today",
-and `notifications_sent` must agree, or same-day dedup breaks). The new tables
-(`sources`, `saints`, `icons`, `favorites`, `follows`, `events`,
-`license_overrides`, `notifications_sent`, `users`) are additive
-`CREATE TABLE IF NOT EXISTS` in both schema files — no ALTER migration needed,
-but still keep both backends in lockstep.
+- `saint_sources.py` — producers. `fetch_saint_records` (Wikipedia bio + Wikidata
+  QID/aliases/feast(`P841`)/CC0 description, with a `qid_overrides` correction
+  hook); `resolve_qid` (wbsearchentities, shared with icons); `clean_wikitext_lead`
+  + `build_name_index`/`normalize_name` for OrthodoxWiki enrichment.
+- `main.run_saints` — Wikipedia spine → `_apply_feast_corrections` →
+  `_enrich_from_orthodoxwiki` (reuses crawled `pages`, matches by override→name→
+  QID). Logged per saint (`[saints N] …`) with phase + end-of-run summaries
+  (`SaintRunStats`). `run_review` emits HOCON correction stubs for the
+  needs-review pile; `run_stats` prints `coverage()`.
+- `storage.py` — `reduce_claims`/`materialized_saint_columns` (per-field:
+  `FACT_FIELDS` servable w/o license, `MULTI_VALUED_FIELDS` union→JSON array,
+  scalars take-top by weight); `set_claims` (replace a source's whole
+  contribution), `recompute_saint`, `CURATED_WEIGHT` (corrections always win).
+
+**Icons = a per-record license gate** (the original pipeline):
+
+- `license_gate.py` — per-record, **fail-closed** gate. Pure/sync classifier.
+- `icon_sources.py` — `SourceAdapter`s (`met_api`, `wikimedia`, `iconsaint`);
+  surface only the license signal + a best-effort `guess_saint_name` hint.
+- `icon_pipeline.py` — override/gate → resolve saint (link to an **already-seeded**
+  QID only, never create) → materialize image only if approved → `store_icon` →
+  `new_icon_added` event.
+- `notifications.py` — daily job; recurring events match `MM-DD`, one-offs today;
+  once-per-day-per-user dedup. Reads `saints.feast_day` (a JSON array) via
+  `sync_recurring_events`.
+
+**Corrections** (`corrections { saint_qid, feast, owiki_qid }` in config) are the
+declarative needs-review workflow — operator-curated, version-controlled, applied
+each run; `--mode review` lists candidates as stubs. Feast corrections enter the
+ledger as a `curated` source at `CURATED_WEIGHT`.
+
+Invariants here: **only `crawl_status='approved'` is servable** (icons); the gate
+fails closed; **different saint fields carry different licensing contracts** —
+prose (`bio`) is withheld while its `*_license` IS NULL, while facts (`feast_day`,
+`alt_names`, CC0 `description`) are core data served without a license; corrections
+always win the reducer; dates are **UTC** end-to-end (`new_icon_added` event_date,
+the notify job's "today", `notifications_sent` must agree). **Schema changes DO
+need migrations now** — `saints.qid` and `saints.description` are added via
+`ADD COLUMN IF NOT EXISTS` (Postgres) / guarded `ALTER` (SQLite `apply_schema`),
+and `saint_claims`'s UNIQUE key includes `value` (Postgres named-constraint swap;
+SQLite rebuilds the derived ledger). Keep both backends in lockstep.
 
 ### The crawl pipeline (scraper.py)
 

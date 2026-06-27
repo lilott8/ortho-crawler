@@ -86,28 +86,31 @@ async def _wbget(qid: str, props: str, session: aiohttp.ClientSession,
 
 async def fetch_wikidata_facts(qid: str, session: aiohttp.ClientSession,
                                limiter: RateLimiter):
-    """(aliases, feast_day_qid) for a saint QID — one wbgetentities call.
+    """(aliases, feast_day_qids, description) for a saint QID — one wbgetentities call.
 
-    Aliases feed the multi-valued ``alt_names`` field; the feast-day QID (first
-    P841 value, if any) is resolved to MM-DD separately (and cached). Both are
-    uncopyrightable facts. Returns ([], None) on any failure.
+    Aliases feed the multi-valued ``alt_names`` field; every P841 value (a saint
+    may have several feast traditions) is collected and resolved to MM-DD
+    separately (and cached); the CC0 description is a core-data one-liner. All are
+    uncopyrightable. Returns ([], [], None) on any failure.
     """
-    ent = await _wbget(qid, "aliases|claims", session, limiter)
+    ent = await _wbget(qid, "aliases|claims|descriptions", session, limiter)
     if ent is None:
-        return [], None
+        return [], [], None
     aliases, seen = [], set()
     for a in (ent.get("aliases") or {}).get("en") or []:
         v = (a.get("value") or "").strip()
         if v and v not in seen:
             seen.add(v)
             aliases.append(v)
-    feast_qid = None
+    feast_qids, fseen = [], set()
     for claim in (ent.get("claims") or {}).get(_WD_P841_FEAST) or []:
         value = (((claim.get("mainsnak") or {}).get("datavalue") or {}).get("value") or {})
-        if value.get("id"):
-            feast_qid = value["id"]      # first feast day; multi-feast is future work
-            break
-    return aliases, feast_qid
+        fid = value.get("id")
+        if fid and fid not in fseen:
+            fseen.add(fid)
+            feast_qids.append(fid)
+    description = ((ent.get("descriptions") or {}).get("en") or {}).get("value") or None
+    return aliases, feast_qids, description
 
 
 async def resolve_feast_md(day_qid: str, session: aiohttp.ClientSession,
@@ -132,7 +135,9 @@ class SaintRecord:
     license: str = WIKIPEDIA_LICENSE
     attribution: str = ""
     alt_names: List[str] = field(default_factory=list)   # Wikidata aliases (multi-valued)
-    feast_day: Optional[str] = None                      # MM-DD, from Wikidata P841 (a fact)
+    feast_days: List[str] = field(default_factory=list)  # MM-DD list, from Wikidata P841 (facts)
+    description: Optional[str] = None                     # CC0 Wikidata one-liner (core data)
+    qid_from_correction: bool = False                    # QID came from a saint_qid override
 
 # ponytail: only mainspace article links are saints; everything else
 # (Category:, File:, Template:, Help:, Portal:, Wikipedia:, List of ...) is
@@ -183,13 +188,16 @@ async def fetch_saint_names(cfg: SaintsConfig, session: aiohttp.ClientSession,
 
 
 async def fetch_saint_records(cfg: SaintsConfig, session: aiohttp.ClientSession,
-                              limiter: RateLimiter) -> AsyncIterator[SaintRecord]:
+                              limiter: RateLimiter,
+                              qid_overrides: Optional[dict] = None) -> AsyncIterator[SaintRecord]:
     """Yield per-saint records (QID + licensed bio) for the configured roster.
 
     Builds on :func:`fetch_saint_names` for the roster, then one ``prop=
     extracts|pageprops`` call per name to pull the Wikidata QID and lead extract.
-    A name that won't resolve to a QID yields ``qid=None`` -> needs-review.
+    A name that won't resolve to a QID yields ``qid=None`` -> needs-review, unless
+    a ``qid_overrides`` correction (display title -> QID) supplies one.
     """
+    qid_overrides = qid_overrides or {}
     feast_cache: dict = {}    # day-item QID -> MM-DD, shared across the roster
     async for target, _display in fetch_saint_names(cfg, session, limiter):
         try:
@@ -224,19 +232,31 @@ async def fetch_saint_records(cfg: SaintsConfig, session: aiohttp.ClientSession,
         title = page.get("title") or target
         qid = (page.get("pageprops", {}) or {}).get("wikibase_item")
         bio = (page.get("extract") or "").strip() or None
+        # A correction can supply a QID Wikipedia didn't carry (rescues a
+        # needs-review saint and unlocks its Wikidata facts on this very run).
+        from_correction = False
         if qid is None:
-            log.info("[saints] %r has no Wikidata QID -> needs-review.", title)
-        alt_names, feast_qid = (await fetch_wikidata_facts(qid, session, limiter)
-                                if qid else ([], None))
-        feast_day = (await resolve_feast_md(feast_qid, session, limiter, feast_cache)
-                     if feast_qid else None)
+            override = qid_overrides.get(title) or qid_overrides.get(target)
+            if override:
+                qid, from_correction = override, True
+            else:
+                log.debug("[saints] %r has no Wikidata QID -> needs-review.", title)
+        alt_names, feast_qids, description = (
+            await fetch_wikidata_facts(qid, session, limiter) if qid else ([], [], None))
+        feast_days = []
+        for fq in feast_qids:
+            md = await resolve_feast_md(fq, session, limiter, feast_cache)
+            if md and md not in feast_days:
+                feast_days.append(md)
         yield SaintRecord(
             qid=qid,
             display_name=title,
             bio_text=bio,
             attribution=_wikipedia_attribution(title),
             alt_names=alt_names,
-            feast_day=feast_day,
+            feast_days=feast_days,
+            description=description,
+            qid_from_correction=from_correction,
         )
 
 
