@@ -18,7 +18,8 @@ import aiosqlite
 from config import DatabaseConfig
 from mediawiki import PageContent
 from storage import (Storage, IconRow, IconStoreResult, SourceState,
-                     parse_ts, _schema_path)
+                     parse_ts, _schema_path, reduce_claims,
+                     materialized_saint_columns, managed_saint_columns)
 
 log = logging.getLogger("ortho_scraper.storage.sqlite")
 
@@ -72,6 +73,20 @@ class SqliteStorage(Storage):
                     "ALTER TABLE pages ADD COLUMN contributors TEXT NOT NULL DEFAULT '[]'")
             if cols and "attribution" not in cols:
                 await self._conn.execute("ALTER TABLE pages ADD COLUMN attribution TEXT")
+            # saints.qid must exist before the schema's saints_qid_idx runs.
+            async with self._conn.execute("PRAGMA table_info(saints)") as cur:
+                saint_cols = {row[1] for row in await cur.fetchall()}
+            if saint_cols and "qid" not in saint_cols:
+                await self._conn.execute("ALTER TABLE saints ADD COLUMN qid TEXT")
+            # saint_claims gained `value` in its UNIQUE key. A pre-existing ledger
+            # with the old 3-column key must be rebuilt — it's a derived ledger,
+            # so re-ingest repopulates it.
+            async with self._conn.execute("PRAGMA table_info(saint_claims)") as cur:
+                sc_exists = bool(await cur.fetchall())
+            if sc_exists and not await self._unique_covers_value("saint_claims"):
+                log.warning("Rebuilding saint_claims for multi-valued UNIQUE key "
+                            "(derived ledger; re-ingest repopulates).")
+                await self._conn.execute("DROP TABLE saint_claims")
             await self._conn.executescript(ddl)
             await self._conn.commit()
         log.info("Schema ensured.")
@@ -375,3 +390,113 @@ class SqliteStorage(Storage):
                 (user_id, event_id, _iso(datetime.now(timezone.utc))),
             )
             await self._conn.commit()
+
+    # --- Saint claims ledger -------------------------------------------------
+
+    async def upsert_saint_by_qid(self, qid, display_name) -> int:
+        async with self._lock:
+            async with self._conn.execute(
+                "SELECT id FROM saints WHERE qid = ?", (qid,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                return row["id"]
+            # Adopt a name-only saint by backfilling its qid (migration/merge).
+            # ponytail: a same display_name already bound to a *different* qid is
+            # treated as the same saint — display name is a weak secondary key,
+            # and saint name collisions across QIDs are vanishingly rare.
+            async with self._conn.execute(
+                "SELECT id, qid FROM saints WHERE canonical_name = ?", (display_name,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                if row["qid"] is None:
+                    await self._conn.execute(
+                        "UPDATE saints SET qid = ? WHERE id = ?", (qid, row["id"]))
+                    await self._conn.commit()
+                return row["id"]
+            cur = await self._conn.execute(
+                "INSERT INTO saints (canonical_name, qid) VALUES (?, ?)", (display_name, qid))
+            sid = cur.lastrowid
+            await self._conn.commit()
+            return sid
+
+    async def _unique_covers_value(self, table: str) -> bool:
+        """True if some UNIQUE index on ``table`` includes the ``value`` column."""
+        async with self._conn.execute(f"PRAGMA index_list({table})") as cur:
+            indexes = await cur.fetchall()
+        for idx in indexes:
+            if not idx["unique"]:
+                continue
+            async with self._conn.execute(f"PRAGMA index_info({idx['name']})") as c2:
+                cols = {r["name"] for r in await c2.fetchall()}
+            if "value" in cols:
+                return True
+        return False
+
+    async def set_claims(self, saint_id, field, values, source_id, weight,
+                         license, attribution) -> None:
+        now = _iso(datetime.now(timezone.utc))
+        async with self._lock:
+            await self._conn.execute(
+                "DELETE FROM saint_claims WHERE saint_id = ? AND field = ? AND source_id = ?",
+                (saint_id, field, source_id))
+            if values:
+                await self._conn.executemany(
+                    """INSERT INTO saint_claims (saint_id, field, value, source_id,
+                                                 weight, license, attribution, observed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(saint_id, field, v, source_id, weight, license, attribution, now)
+                     for v in values])
+            await self._conn.commit()
+
+    async def recompute_saint(self, saint_id) -> None:
+        async with self._lock:
+            async with self._conn.execute(
+                """SELECT field, value, source_id, weight, license, attribution
+                   FROM saint_claims WHERE saint_id = ?""", (saint_id,)) as cur:
+                claims = [_row_to_dict(r) for r in await cur.fetchall()]
+            winners = reduce_claims(claims)
+            # Reset every managed column, then apply winners: a claim that lost
+            # its license (or vanished) must clear its slot — fail closed.
+            cols = {c: None for c in managed_saint_columns()}
+            cols.update(materialized_saint_columns(winners))
+            assignments = ", ".join(f"{k} = ?" for k in cols)
+            await self._conn.execute(
+                f"UPDATE saints SET {assignments} WHERE id = ?",
+                (*cols.values(), saint_id))
+            await self._conn.commit()
+
+    async def saint_bio_coverage(self):
+        async with self._conn.execute(
+            """SELECT COUNT(*) AS total,
+                      COUNT(CASE WHEN bio_text IS NOT NULL AND bio_license IS NOT NULL
+                                 THEN 1 END) AS with_bio
+               FROM saints""") as cur:
+            row = await cur.fetchone()
+        return (row["total"], row["with_bio"])
+
+    async def coverage(self):
+        async with self._conn.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM saints) AS saints_total,
+                 (SELECT COUNT(*) FROM saints
+                    WHERE bio_text IS NOT NULL AND bio_license IS NOT NULL) AS saints_with_bio,
+                 (SELECT COUNT(*) FROM saints WHERE qid IS NULL) AS saints_needs_review,
+                 (SELECT COUNT(*) FROM saints WHERE feast_day IS NOT NULL) AS saints_with_feast,
+                 (SELECT COUNT(*) FROM icons) AS icons_total,
+                 (SELECT COUNT(*) FROM icons WHERE crawl_status='approved') AS icons_approved,
+                 (SELECT COUNT(*) FROM icons WHERE saint_id IS NOT NULL) AS icons_linked,
+                 (SELECT COUNT(*) FROM icons
+                    WHERE saint_id IS NULL AND crawl_status='approved') AS icons_orphan,
+                 (SELECT COUNT(*) FROM saint_claims) AS claims_total""") as cur:
+            return _row_to_dict(await cur.fetchone())
+
+    async def all_saint_names(self):
+        async with self._conn.execute(
+            "SELECT id, canonical_name, alt_names, qid FROM saints") as cur:
+            return [_row_to_dict(r) for r in await cur.fetchall()]
+
+    async def fetch_saint_candidate_pages(self):
+        async with self._conn.execute(
+            """SELECT title, content, attribution FROM pages
+               WHERE namespace = 0 AND removed_at IS NULL AND content IS NOT NULL""") as cur:
+            return [_row_to_dict(r) for r in await cur.fetchall()]

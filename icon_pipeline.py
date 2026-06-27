@@ -36,9 +36,10 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from config import Config
+from config import Config, select_policy
 from icon_sources import RawRecord, _HttpJson, build_adapters
 from license_gate import APPROVED, GateResult, LicenseGate, QUARANTINED, REJECTED, Source
+from saint_sources import resolve_qid
 from storage import IconRow, Storage
 
 log = logging.getLogger("ortho_scraper.icon_pipeline")
@@ -50,6 +51,7 @@ class IconRunStats:
     seen: int = 0
     by_status: Counter = field(default_factory=Counter)
     approved_new: int = 0
+    unresolved: int = 0          # image kept, saint-link left for review (no clean QID)
     image_downloaded: int = 0
     image_deduped: int = 0
     image_skipped: int = 0
@@ -64,6 +66,7 @@ class IconRunStats:
 class IconPipeline:
     def __init__(self, config: Config, session: aiohttp.ClientSession, db: Storage):
         self._cfg = config.icons
+        self._policies = config.license_policies
         self._session = session
         self._db = db
         self._gate = LicenseGate()
@@ -169,7 +172,7 @@ class IconPipeline:
         log.info("Source %r: processed %d record(s).", adapter.name, n)
 
     async def _decide(self, source: Source, record: RawRecord) -> GateResult:
-        """Manual override (if any) wins over the automated gate, and is audited."""
+        """Precedence: per-record override > per-type policy > automated gate."""
         override = await self._db.get_license_override(source.name, record.source_record_id)
         if override:
             if override.get("decision") == "approved":
@@ -181,18 +184,37 @@ class IconPipeline:
                                   attribution=attribution, reason="manual_override")
             return GateResult(status=REJECTED,
                               reason=f"manual_override:{override.get('reason') or 'rejected'}")
+        policy = select_policy(self._policies, "icon", source.name, None)
+        if policy:
+            if policy.decision == "approved":
+                lic = policy.license or source.base_license
+                # Attribution stays mandatory: synthesize one if the policy omits it.
+                attribution = policy.attribution or f"{source.name} ({lic})"
+                return GateResult(status=APPROVED, license=lic,
+                                  attribution=attribution, reason="policy_override")
+            return GateResult(status=REJECTED, reason="policy_override")
         return self._gate.evaluate(source, record)
 
     async def _resolve_saint(self, record: RawRecord) -> Optional[int]:
+        """Resolve a record's (low-trust) saint label to a QID and link on a clean
+        hit only; otherwise keep the image but leave the link for review (Q13)."""
         name = (record.saint_name or "").strip()
         if not name:
             return None
-        cached = self._saint_cache.get(name)
-        if cached is not None:
-            return cached
-        saint_id = await self._db.upsert_saint(name)
+        if name in self._saint_cache:            # None is a valid cached result
+            return self._saint_cache[name]
+        qid = None
+        try:
+            qid = await resolve_qid(name, self._http)
+        except Exception as exc:  # noqa: BLE001 - a resolver hiccup must not kill ingest
+            log.debug("QID resolve failed for %r: %s", name, exc)
+        if qid:
+            saint_id = await self._db.upsert_saint_by_qid(qid, name)
+            self._stats.saints += 1
+        else:
+            saint_id = None                       # image still stored; link -> review
+            self._stats.unresolved += 1
         self._saint_cache[name] = saint_id
-        self._stats.saints += 1
         return saint_id
 
     async def _maybe_new_icon_event(self, saint_id: Optional[int], icon_id: int) -> None:
@@ -278,7 +300,8 @@ class IconPipeline:
         log.info("  Records   : %d seen | %d approved, %d quarantined, %d rejected, %d pending",
                  s.seen, st.get(APPROVED, 0), st.get(QUARANTINED, 0), st.get(REJECTED, 0),
                  st.get("pending_license_check", 0))
-        log.info("  Approvals : %d newly approved | %d saints touched", s.approved_new, s.saints)
+        log.info("  Approvals : %d newly approved | %d saints linked | %d links unresolved",
+                 s.approved_new, s.saints, s.unresolved)
         log.info("  Images    : %d downloaded, %d already-on-disk, %d skipped, %d failed",
                  s.image_downloaded, s.image_deduped, s.image_skipped, s.image_failed)
         log.info("  Events    : %d new_icon_added written", s.events)

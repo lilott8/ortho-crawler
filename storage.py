@@ -8,10 +8,11 @@ concrete backend is used (PostgreSQL or SQLite) is decided by
 from __future__ import annotations
 
 import abc
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from config import DatabaseConfig
 from mediawiki import PageContent
@@ -180,6 +181,142 @@ class Storage(abc.ABC):
     @abc.abstractmethod
     async def record_notification(self, user_id: int, event_id: int) -> None:
         """Persist that a notification was dispatched."""
+
+    # --- Saint claims ledger (additive multi-source merge) ------------------
+
+    @abc.abstractmethod
+    async def upsert_saint_by_qid(self, qid: str, display_name: str) -> int:
+        """Resolve a saint by Wikidata QID, creating it if needed; return its id.
+
+        If a name-only saint (qid IS NULL) already exists under ``display_name``,
+        it is adopted by backfilling the qid (the migration/merge path) rather
+        than creating a duplicate.
+        """
+
+    @abc.abstractmethod
+    async def set_claims(self, saint_id: int, field: str, values: List[str],
+                         source_id: int, weight: int,
+                         license: Optional[str], attribution: Optional[str]) -> None:
+        """Replace this source's entire contribution to (saint, field).
+
+        Deletes the source's prior rows for the field, then inserts one row per
+        value — so a re-ingest correctly handles updated *and* removed values, for
+        scalar (one value) and multi-valued (many) fields alike. ``license=None``
+        stores rows for audit but leaves them un-servable for non-fact fields.
+        """
+
+    async def add_claim(self, saint_id: int, field: str, value: str,
+                        source_id: int, weight: int,
+                        license: Optional[str], attribution: Optional[str]) -> None:
+        """Convenience for a single-valued claim — a 1-element :meth:`set_claims`."""
+        await self.set_claims(saint_id, field, [value], source_id, weight,
+                              license, attribution)
+
+    @abc.abstractmethod
+    async def recompute_saint(self, saint_id: int) -> None:
+        """Fold this saint's claims into the materialized saints.* columns.
+
+        Idempotent; re-runnable any time a claim/weight/license changes. Only
+        license-cleared claims (or fact fields) win a servable slot.
+        """
+
+    @abc.abstractmethod
+    async def saint_bio_coverage(self) -> Tuple[int, int]:
+        """(total saints, saints with a servable bio) — coverage at a glance."""
+
+    @abc.abstractmethod
+    async def coverage(self) -> Dict[str, int]:
+        """Cross-pipeline visibility counts for the `--mode stats` report.
+
+        Keys: saints_total, saints_with_bio, saints_with_feast,
+        saints_needs_review, icons_total, icons_approved, icons_linked,
+        icons_orphan, claims_total.
+        """
+
+    @abc.abstractmethod
+    async def all_saint_names(self) -> List[dict]:
+        """Rows of {id, canonical_name, alt_names, qid} for building name and QID
+        indexes (OrthodoxWiki enrichment matches crawled pages by name, then QID)."""
+
+    @abc.abstractmethod
+    async def fetch_saint_candidate_pages(self) -> List[dict]:
+        """Active main-namespace crawled pages with content, as
+        {title, content, attribution} — bio-claim candidates for enrichment."""
+
+
+# Fact fields are uncopyrightable (a feast date or a short name can't be
+# license-encumbered), so they are servable without a cleared license.
+FACT_FIELDS = frozenset({"feast_day", "alt_names"})
+
+# Fields whose reducer keeps the whole weight-ordered set (union) instead of one
+# winner. Their value column holds a JSON array.
+MULTI_VALUED_FIELDS = frozenset({"alt_names"})
+
+# How a field maps onto saints.* columns: field -> (value_col,
+# source_col_or_None, license_col_or_None). Multi-valued fields use value_col
+# only (their array carries no single source/license).
+_SAINT_FIELD_COLUMNS = {
+    "bio": ("bio_text", "bio_source_id", "bio_license"),
+    "feast_day": ("feast_day", None, None),
+    "alt_names": ("alt_names", None, None),
+}
+
+
+def reduce_claims(claims: Iterable[dict]) -> Dict[str, List[dict]]:
+    """Per-field reducer: the servable claims for each field, weight-desc.
+
+    Drops uncleared non-fact claims (fail closed). Returns a list per field so a
+    scalar field's winner is ``[0]`` and a multi-valued field keeps the whole
+    ordered set. Sort is stable, so equal-weight claims keep ingest order.
+    """
+    by_field: Dict[str, List[dict]] = {}
+    for c in claims:
+        field = c["field"]
+        servable = field in FACT_FIELDS or bool(c.get("license"))
+        if not servable:
+            continue
+        by_field.setdefault(field, []).append(c)
+    for field, cs in by_field.items():
+        cs.sort(key=lambda c: c["weight"], reverse=True)
+    return by_field
+
+
+def managed_saint_columns() -> List[str]:
+    """Every saints.* column the reducer owns — reset these before writing winners
+    so a withdrawn/withheld claim clears its slot (fail-closed)."""
+    cols: List[str] = []
+    for value_col, source_col, license_col in _SAINT_FIELD_COLUMNS.values():
+        cols += [c for c in (value_col, source_col, license_col) if c]
+    return cols
+
+
+def materialized_saint_columns(reduced: Dict[str, List[dict]]) -> Dict[str, object]:
+    """Translate reducer output into a {saints_column: value} update map.
+
+    Scalar fields take the top claim; multi-valued fields union their values in
+    weight order (dedup, order-preserving) into a JSON array.
+    """
+    cols: Dict[str, object] = {}
+    for field, claim_list in reduced.items():
+        mapping = _SAINT_FIELD_COLUMNS.get(field)
+        if not mapping or not claim_list:
+            continue  # unknown field has no materialized home yet
+        value_col, source_col, license_col = mapping
+        if field in MULTI_VALUED_FIELDS:
+            seen, ordered = set(), []
+            for c in claim_list:                      # already weight-desc
+                if c["value"] not in seen:
+                    seen.add(c["value"])
+                    ordered.append(c["value"])
+            cols[value_col] = json.dumps(ordered)
+        else:
+            top = claim_list[0]
+            cols[value_col] = top["value"]
+            if source_col:
+                cols[source_col] = top["source_id"]
+            if license_col:
+                cols[license_col] = top.get("license")
+    return cols
 
 
 def _schema_path(name: str) -> str:

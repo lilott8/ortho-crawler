@@ -13,7 +13,8 @@ import json
 from config import DatabaseConfig
 from mediawiki import PageContent
 from storage import (Storage, IconRow, IconStoreResult, SourceState,
-                     parse_ts, _schema_path)
+                     parse_ts, _schema_path, reduce_claims,
+                     materialized_saint_columns, managed_saint_columns)
 
 log = logging.getLogger("ortho_scraper.storage.postgres")
 
@@ -311,3 +312,90 @@ class PostgresStorage(Storage):
             "INSERT INTO notifications_sent (user_id, event_id, sent_at) VALUES ($1, $2, now())",
             user_id, event_id,
         )
+
+    # --- Saint claims ledger -------------------------------------------------
+
+    async def upsert_saint_by_qid(self, qid, display_name) -> int:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                sid = await conn.fetchval("SELECT id FROM saints WHERE qid = $1", qid)
+                if sid is not None:
+                    return sid
+                # Adopt a name-only saint by backfilling its qid (migration/merge).
+                # ponytail: a same display_name bound to a different qid is treated
+                # as the same saint (display name is a weak secondary key).
+                row = await conn.fetchrow(
+                    "SELECT id, qid FROM saints WHERE canonical_name = $1", display_name)
+                if row is not None:
+                    if row["qid"] is None:
+                        await conn.execute(
+                            "UPDATE saints SET qid = $1 WHERE id = $2", qid, row["id"])
+                    return row["id"]
+                return await conn.fetchval(
+                    "INSERT INTO saints (canonical_name, qid) VALUES ($1, $2) RETURNING id",
+                    display_name, qid)
+
+    async def set_claims(self, saint_id, field, values, source_id, weight,
+                         license, attribution) -> None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """DELETE FROM saint_claims
+                       WHERE saint_id = $1 AND field = $2 AND source_id = $3""",
+                    saint_id, field, source_id)
+                if values:
+                    await conn.executemany(
+                        """INSERT INTO saint_claims (saint_id, field, value, source_id,
+                                                     weight, license, attribution)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                        [(saint_id, field, v, source_id, weight, license, attribution)
+                         for v in values])
+
+    async def recompute_saint(self, saint_id) -> None:
+        rows = await self._pool.fetch(
+            """SELECT field, value, source_id, weight, license, attribution
+               FROM saint_claims WHERE saint_id = $1""", saint_id)
+        winners = reduce_claims([dict(r) for r in rows])
+        cols = {c: None for c in managed_saint_columns()}
+        cols.update(materialized_saint_columns(winners))
+        keys = list(cols)
+        assignments = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(keys))
+        await self._pool.execute(
+            f"UPDATE saints SET {assignments} WHERE id = ${len(keys) + 1}",
+            *cols.values(), saint_id,
+        )
+
+    async def saint_bio_coverage(self):
+        row = await self._pool.fetchrow(
+            """SELECT COUNT(*) AS total,
+                      COUNT(*) FILTER (WHERE bio_text IS NOT NULL
+                                         AND bio_license IS NOT NULL) AS with_bio
+               FROM saints""")
+        return (row["total"], row["with_bio"])
+
+    async def coverage(self):
+        row = await self._pool.fetchrow(
+            """SELECT
+                 (SELECT COUNT(*) FROM saints) AS saints_total,
+                 (SELECT COUNT(*) FROM saints
+                    WHERE bio_text IS NOT NULL AND bio_license IS NOT NULL) AS saints_with_bio,
+                 (SELECT COUNT(*) FROM saints WHERE qid IS NULL) AS saints_needs_review,
+                 (SELECT COUNT(*) FROM saints WHERE feast_day IS NOT NULL) AS saints_with_feast,
+                 (SELECT COUNT(*) FROM icons) AS icons_total,
+                 (SELECT COUNT(*) FROM icons WHERE crawl_status='approved') AS icons_approved,
+                 (SELECT COUNT(*) FROM icons WHERE saint_id IS NOT NULL) AS icons_linked,
+                 (SELECT COUNT(*) FROM icons
+                    WHERE saint_id IS NULL AND crawl_status='approved') AS icons_orphan,
+                 (SELECT COUNT(*) FROM saint_claims) AS claims_total""")
+        return dict(row)
+
+    async def all_saint_names(self):
+        rows = await self._pool.fetch(
+            "SELECT id, canonical_name, alt_names, qid FROM saints")
+        return [dict(r) for r in rows]
+
+    async def fetch_saint_candidate_pages(self):
+        rows = await self._pool.fetch(
+            """SELECT title, content, attribution FROM pages
+               WHERE namespace = 0 AND removed_at IS NULL AND content IS NOT NULL""")
+        return [dict(r) for r in rows]

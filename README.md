@@ -88,11 +88,15 @@ Set `database.backend` to `"postgres"` or `"sqlite"`.
 # Licensed Icon & Saints ingestion (Met / Wikimedia / ICONSAINT):
 ./.venv/bin/python main.py --config scraper.conf --mode icons
 
-# Saint roster from Wikipedia list articles (names only, no images/licensing):
+# Saints: identity (Wikidata QID) + licensed bios + aliases + feast days,
+# merged from Wikipedia and OrthodoxWiki via the claims ledger:
 ./.venv/bin/python main.py --config scraper.conf --mode saints
 
 # Daily follower-notification job (feast/nameday/veneration/new-icon):
 ./.venv/bin/python main.py --config scraper.conf --mode notify
+
+# Read-only coverage report (saints with bios/feast days, needs-review, icons):
+./.venv/bin/python main.py --config scraper.conf --mode stats
 ```
 
 All modes share the config file and the database, and each works with
@@ -278,9 +282,10 @@ decoupled from crawl cadence. It matches recurring events (feast/nameday/
 veneration) on `MM-DD` and one-off `new_icon_added` events on today's date, then
 notifies each follower exactly once per day (re-running the job is safe).
 Delivery is pluggable (a `dispatch` callable; the default logs) — push/email
-infra is out of scope. Feast/veneration **dates are mostly NULL at launch** (no
-verified-licensed text source yet); as they get populated, `sync_recurring_events`
-materializes the events automatically.
+infra is out of scope. **Feast dates are now populated by `--mode saints`** (from
+Wikidata `P841`), and `sync_recurring_events` materializes the events from any
+saint with a `feast_day`; saints whose Wikidata entry has no feast day stay
+NULL (and uncounted) until a future producer or a curated override fills them.
 
 > **Text vs. images are licensed independently.** An approved image does **not**
 > approve a bio: `saints.bio_text` is withheld while `saints.bio_license` is NULL.
@@ -295,19 +300,44 @@ least one source under `icons.sources`. Each source carries its
 `search_terms` / `max_files`, or `dataset_path` / `manifest`). The layer has its
 own `rate_limit` and `http` blocks (separate budget — different hosts).
 
-## Saint roster (`--mode saints`)
+## Saints: multi-source claims (`--mode saints`)
 
-A separate, much simpler job from the icon pipeline: it parses one or more
-Wikipedia **list articles** and upserts the linked saint names into the `saints`
-table. No images, no licensing gate — English Wikipedia text is CC BY-SA/GFDL as
-a blanket fact about the source, so there is nothing per-record to verify. A
-missing or renamed article is logged and skipped, never fatal.
+Saints are built by merging signals from several sources into one record, keyed
+by **Wikidata QID** (so "St. John Chrysostom" and "John Chrysostom" are the same
+saint). Each source contributes *claims* to a `saint_claims` ledger; a per-field
+reducer folds them into the servable `saints.*` columns. See
+[`docs/saints-redesign.md`](docs/saints-redesign.md) for the full design.
+
+What a `--mode saints` run does:
+
+1. **Wikipedia (the content spine).** For each saint in the configured list
+   articles, fetch its Wikidata QID, lead-extract **bio** (CC BY-SA, attributed),
+   Wikidata **aliases** (`alt_names`, multi-valued), and **feast day** (`P841` →
+   MM-DD). A name with no QID is kept as **needs-review** (`qid IS NULL`), never
+   wrongly merged.
+2. **OrthodoxWiki enrichment** (if `orthodoxwiki_weight > 0`). Reuses pages
+   already crawled by `--mode wiki` — no extra crawl. Matches each page to an
+   existing saint by name/alias, then by QID for misses, and contributes a
+   lower-weight CC BY-SA 2.5 bio. It **only wins** a saint's bio slot when
+   Wikipedia has none.
+
+Merge rules: **per-field reducers**, not a single overwrite. Scalar fields
+(`bio`) take the highest-weight *license-cleared* claim; multi-valued fields
+(`alt_names`) union all values in weight order. **Facts** (`feast_day`, names)
+are servable without a license; **prose** (`bio`) is withheld unless a license is
+captured — so `saints.bio_text` is served only when `saints.bio_license` is set.
 
 Configure it in the `saints { … }` block of [`scraper.conf`](scraper.conf):
-`enabled`, `wikipedia_articles` (article **titles**, not URLs — e.g.
-`"List of Eastern Orthodox saints"` for
-<https://en.wikipedia.org/wiki/List_of_Eastern_Orthodox_saints>), and
-`max_records`. Run with `--mode saints` (combinable with `--loop`).
+`enabled`, `wikipedia_articles` (article **titles**, not URLs), `max_records`,
+and the source weights `wikipedia_weight` / `orthodoxwiki_weight`. Coarse,
+per-type licensing overrides live in the top-level `license_policies` list.
+
+### Visibility (`--mode stats`)
+
+`--mode stats` prints a read-only coverage report straight from the ledger:
+saints total, saints with a servable bio, saints with a feast day, needs-review
+count, icons total/approved/linked/orphan, and claims in the ledger — the quick
+answer to "what do we actually have, and where are the gaps."
 
 ## Files
 
