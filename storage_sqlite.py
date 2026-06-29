@@ -89,6 +89,17 @@ class SqliteStorage(Storage):
                 log.warning("Rebuilding saint_claims for multi-valued UNIQUE key "
                             "(derived ledger; re-ingest repopulates).")
                 await self._conn.execute("DROP TABLE saint_claims")
+            # Icons refactor: drop the old-shape icon layer (rendition model + m2m
+            # links + tags). No migration — disabled-by-default layer, no prod data.
+            # Guarded by the old column so it fires once. favorites FKs icons, so it
+            # goes too (empty); the schema recreates it.
+            async with self._conn.execute("PRAGMA table_info(icons)") as cur:
+                icon_cols = {row[1] for row in await cur.fetchall()}
+            if icon_cols and "image_source_id" in icon_cols:
+                log.warning("Dropping old-shape icon layer for the renditions refactor "
+                            "(no prod data; recreated fresh).")
+                for tbl in ("favorites", "icon_saints", "icon_tags", "icons"):
+                    await self._conn.execute(f"DROP TABLE IF EXISTS {tbl}")
             await self._conn.executescript(ddl)
             await self._conn.commit()
         log.info("Schema ensured.")
@@ -248,7 +259,7 @@ class SqliteStorage(Storage):
             cur = await self._conn.execute(
                 """UPDATE icons SET crawl_status = 'pending_license_check',
                                     updated_at = ?
-                   WHERE image_source_id = ? AND crawl_status = 'approved'""",
+                   WHERE source_id = ? AND crawl_status = 'approved'""",
                 (_iso(datetime.now(timezone.utc)), source_id),
             )
             n = cur.rowcount
@@ -284,21 +295,21 @@ class SqliteStorage(Storage):
         async with self._lock:
             async with self._conn.execute(
                 """SELECT id, crawl_status FROM icons
-                   WHERE image_source_id = ? AND source_record_id = ?""",
-                (row.image_source_id, row.source_record_id),
+                   WHERE source_id = ? AND uri = ?""",
+                (row.source_id, row.uri),
             ) as cur:
                 existing = await cur.fetchone()
             if existing is None:
                 cur = await self._conn.execute(
-                    """INSERT INTO icons (saint_id, title, image_url, image_source_id,
-                                          image_license, attribution_text, description,
-                                          veneration_date, source_record_id, crawl_status,
-                                          quarantine_reason, local_path, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (row.saint_id, row.title, row.image_url, row.image_source_id,
-                     row.image_license, row.attribution_text, row.description,
-                     row.veneration_date, row.source_record_id, row.crawl_status,
-                     row.quarantine_reason, row.local_path, now, now),
+                    """INSERT INTO icons (source_id, uri, source_record_id, sha1, etag,
+                                          title, description, license, attribution,
+                                          crawl_status, quarantine_reason, local_path,
+                                          last_crawled, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (row.source_id, row.uri, row.source_record_id, row.sha1, row.etag,
+                     row.title, row.description, row.license, row.attribution,
+                     row.crawl_status, row.quarantine_reason, row.local_path,
+                     now, now, now),
                 )
                 icon_id = cur.lastrowid
                 newly_approved = row.crawl_status == "approved"
@@ -307,17 +318,75 @@ class SqliteStorage(Storage):
                 newly_approved = (row.crawl_status == "approved"
                                   and existing["crawl_status"] != "approved")
                 await self._conn.execute(
-                    """UPDATE icons SET saint_id = ?, title = ?, image_url = ?,
-                            image_license = ?, attribution_text = ?, description = ?,
-                            veneration_date = ?, crawl_status = ?, quarantine_reason = ?,
-                            local_path = ?, updated_at = ?
+                    """UPDATE icons SET source_record_id = ?, sha1 = ?, etag = ?,
+                            title = ?, description = ?, license = ?, attribution = ?,
+                            crawl_status = ?, quarantine_reason = ?, local_path = ?,
+                            last_crawled = ?, updated_at = ?
                        WHERE id = ?""",
-                    (row.saint_id, row.title, row.image_url, row.image_license,
-                     row.attribution_text, row.description, row.veneration_date,
-                     row.crawl_status, row.quarantine_reason, row.local_path, now, icon_id),
+                    (row.source_record_id, row.sha1, row.etag, row.title,
+                     row.description, row.license, row.attribution, row.crawl_status,
+                     row.quarantine_reason, row.local_path, now, now, icon_id),
                 )
             await self._conn.commit()
         return IconStoreResult(icon_id=icon_id, newly_approved=newly_approved)
+
+    async def get_icon_recrawl_state(self, source_id, uri):
+        async with self._conn.execute(
+            """SELECT last_crawled, etag, sha1, local_path FROM icons
+               WHERE source_id = ? AND uri = ?""",
+            (source_id, uri),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        d = _row_to_dict(row)
+        d["last_crawled"] = parse_ts(d["last_crawled"]) if d["last_crawled"] else None
+        return d
+
+    async def bump_icon_crawled(self, source_id, uri, etag=None) -> None:
+        now = _iso(datetime.now(timezone.utc))
+        async with self._lock:
+            await self._conn.execute(
+                """UPDATE icons SET last_crawled = ?, updated_at = ?,
+                       etag = COALESCE(?, etag)
+                   WHERE source_id = ? AND uri = ?""",
+                (now, now, etag, source_id, uri),
+            )
+            await self._conn.commit()
+
+    async def link_icon_saint(self, icon_id, saint_id) -> None:
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO icon_saints (icon_id, saint_id) VALUES (?, ?)",
+                (icon_id, saint_id))
+            await self._conn.commit()
+
+    async def linked_saints(self, icon_id) -> List[int]:
+        async with self._conn.execute(
+            "SELECT saint_id FROM icon_saints WHERE icon_id = ?", (icon_id,)) as cur:
+            return [r["saint_id"] for r in await cur.fetchall()]
+
+    async def link_icon_tags(self, icon_id, names) -> None:
+        await self._link_tags("icon_tags", "icon_id", icon_id, names)
+
+    async def link_saint_tags(self, saint_id, names) -> None:
+        await self._link_tags("saint_tags", "saint_id", saint_id, names)
+
+    async def _link_tags(self, table, col, owner_id, names) -> None:
+        clean = {n.strip() for n in names if n and n.strip()}
+        if not clean:
+            return
+        async with self._lock:
+            for name in clean:
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO tags (name) VALUES (?)", (name,))
+                async with self._conn.execute(
+                    "SELECT id FROM tags WHERE name = ?", (name,)) as cur:
+                    tag_id = (await cur.fetchone())["id"]
+                await self._conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({col}, tag_id) VALUES (?, ?)",
+                    (owner_id, tag_id))
+            await self._conn.commit()
 
     async def count_followers(self, target_type, target_id) -> int:
         async with self._conn.execute(
@@ -348,11 +417,9 @@ class SqliteStorage(Storage):
                    SELECT 'saint', s.id, 'feast_day', je.value
                    FROM saints s, json_each(s.feast_day) je
                    WHERE s.feast_day IS NOT NULL AND json_valid(s.feast_day)""")
-            c2 = await self._conn.execute(
-                """INSERT OR IGNORE INTO events (target_type, target_id, event_type, event_date)
-                   SELECT 'icon', id, 'veneration_day', veneration_date FROM icons
-                   WHERE veneration_date IS NOT NULL AND crawl_status = 'approved'""")
-            total = (c1.rowcount or 0) + (c2.rowcount or 0)
+            # Icons no longer carry veneration_date (renditions refactor); only
+            # saint feast days recur here.
+            total = (c1.rowcount or 0)
             await self._conn.commit()
         return total
 
@@ -495,9 +562,10 @@ class SqliteStorage(Storage):
                  (SELECT COUNT(*) FROM saints WHERE feast_day IS NOT NULL) AS saints_with_feast,
                  (SELECT COUNT(*) FROM icons) AS icons_total,
                  (SELECT COUNT(*) FROM icons WHERE crawl_status='approved') AS icons_approved,
-                 (SELECT COUNT(*) FROM icons WHERE saint_id IS NOT NULL) AS icons_linked,
-                 (SELECT COUNT(*) FROM icons
-                    WHERE saint_id IS NULL AND crawl_status='approved') AS icons_orphan,
+                 (SELECT COUNT(DISTINCT icon_id) FROM icon_saints) AS icons_linked,
+                 (SELECT COUNT(*) FROM icons i WHERE crawl_status='approved'
+                    AND NOT EXISTS (SELECT 1 FROM icon_saints s
+                                    WHERE s.icon_id = i.id)) AS icons_orphan,
                  (SELECT COUNT(*) FROM saint_claims) AS claims_total""") as cur:
             return _row_to_dict(await cur.fetchone())
 

@@ -20,7 +20,7 @@ import aiohttp
 from config import load_config, parse_duration, select_policy
 from storage import CURATED_WEIGHT, create_storage
 from mediawiki import MediaWikiClient
-from ratelimit import RateLimiter
+from ratelimit import RateLimiter, TokenBucket
 from scraper import Scraper
 from icon_pipeline import IconPipeline
 from notifications import run_daily_notifications
@@ -85,14 +85,26 @@ async def run_icons(config, db) -> None:
     timeout = aiohttp.ClientTimeout(total=ic.http.timeout)
     # Reuse the wiki scraper's User-Agent for a polite, identifying contact.
     headers = {"User-Agent": config.scraper.user_agent}
-    limiter = RateLimiter(
-        requests_per_second=ic.rate_limit.requests_per_second,
-        burst=ic.rate_limit.burst,
-        max_concurrency=ic.rate_limit.max_concurrency,
-    )
+    # One limiter per source so a tight budget (WikiArt 400/hr) never throttles
+    # the others; a multi-bucket limiter enforces requests/sec AND requests/hour.
+    source_limiters = {name: _build_limiter(sc) for name, sc in ic.sources.items()}
+    default_limiter = _build_limiter_from(ic.rate_limit, 0)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        pipeline = IconPipeline(config, session, db).with_limiter(limiter)
+        pipeline = IconPipeline(config, session, db).with_limiters(
+            source_limiters, default_limiter)
         await pipeline.run()
+
+
+def _build_limiter(sc) -> RateLimiter:
+    return _build_limiter_from(sc.rate_limit, sc.hourly_cap)
+
+
+def _build_limiter_from(rl, hourly_cap: int) -> RateLimiter:
+    buckets = [TokenBucket(rl.requests_per_second, rl.burst)]
+    if hourly_cap > 0:
+        # Second bucket: ~cap/3600 per second, capacity = the hourly cap itself.
+        buckets.append(TokenBucket(hourly_cap / 3600.0, hourly_cap))
+    return RateLimiter(buckets=buckets, max_concurrency=rl.max_concurrency)
 
 
 async def run_notify(config, db) -> None:
@@ -365,6 +377,7 @@ async def run_once(config, modes: list) -> None:
 
 async def main_async(args) -> int:
     config = load_config(args.config)
+    config.icons.force_recrawl = bool(args.force_recrawl)
     modes = resolve_modes(args.mode)
     label = "+".join(modes)
 
@@ -400,6 +413,10 @@ def main() -> int:
     parser.add_argument("--loop", metavar="DURATION", default=None,
                         help="Run continuously, sleeping this long between passes "
                              "(e.g. '6h', '30 minutes'). Default: run once and exit.")
+    parser.add_argument("--force-recrawl", action="store_true",
+                        help="Icons: ignore icons.recrawl_after and re-fetch every "
+                             "discovered record this run (conditional GET still "
+                             "skips unchanged bytes).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging.")
     args = parser.parse_args()

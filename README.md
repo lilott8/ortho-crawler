@@ -85,8 +85,9 @@ Set `database.backend` to `"postgres"` or `"sqlite"`.
 # OrthodoxWiki category scraper (default):
 ./.venv/bin/python main.py --config scraper.conf --mode wiki
 
-# Licensed Icon & Saints ingestion (Met / Wikimedia / ICONSAINT):
+# Licensed Icon & Saints ingestion (Met / Wikimedia / Wikipedia / WikiArt / ICONSAINT):
 ./.venv/bin/python main.py --config scraper.conf --mode icons
+# ...add --force-recrawl to re-fetch every stored icon (ignores recrawl_after).
 
 # Saints: identity (Wikidata QID) + licensed bios + aliases + feast days,
 # merged from Wikipedia and OrthodoxWiki via the claims ledger:
@@ -258,6 +259,8 @@ positively classify is quarantined (kept for audit, never surfaced).
 | --- | --- |
 | **Met Open Access** (`met_api`) | Public-domain **per object** — `isPublicDomain` is checked on every record; non-PD → quarantined. |
 | **Wikimedia Commons** (`wikimedia`) | Per-file license tag (from `extmetadata`) checked against a configured `allowed_licenses` allowlist. |
+| **Wikipedia category** (`wikipedia`) | Walks an article category (e.g. `Category:Eastern Orthodox icons`, recursing subcats to `subcat_depth`) and takes each article's **lead image** — the icon. Images are Commons-hosted, so licensing is the same per-file `extmetadata` allowlist as `wikimedia`; the article title is a strong saint hint. |
+| **WikiArt** (`wikiart`) | Paginated painting search; needs an API key (`api_key = ${?WIKIART_API_KEY}`). Licensing is murky and the API exposes no clean per-image license, so the gate is **fail-closed (stub)**: records are **crawled** but land `quarantined` until promoted via a `license_policies` rule or per-record override. Per-source rate budget (free tier: 4/s, 400/hr). |
 | **ICONSAINT** (`iconsaint`) | Blanket **CC BY** grant verified via the companion paper (DOI 10.3390/info17040340). Images-only; attribution is **required** per image. Read from a *local* checkout — point `icons.sources.iconsaint.dataset_path` at it **after** the 5-minute manual check that the repo's own LICENSE doesn't conflict with the paper's CC BY. |
 
 Commercial monastery/store sites and (by default) archdiocese sites are excluded
@@ -273,16 +276,27 @@ as unlicensed; a per-record human override is available (see below).
 3. **The gate** classifies each record. Precedence: a per-record
    `license_overrides` row → a per-type `license_policies` rule → the automated
    gate (all auditable, kept separate).
-4. **Saint linkage.** Adapters emit a best-effort saint hint (ICONSAINT labels;
-   a `guess_saint_name` from Met/Commons titles). The pipeline resolves it to a
-   Wikidata QID and links the icon **only to an already-seeded saint** (it never
-   creates saints); otherwise the image is still stored, with the link left for
-   review.
+4. **Saint linkage (many-to-many).** Adapters emit a best-effort saint hint
+   (ICONSAINT labels; a `guess_saint_name` from titles). The pipeline resolves it
+   to a Wikidata QID and links the icon **only to an already-seeded saint** (it
+   never creates saints), via the `icon_saints` join — an icon may depict several
+   saints and a saint many icons. No clean match → the image is still stored, the
+   link left for review.
 5. **Approved** icons get their image fetched into content-addressed storage
-   (`icons.download_dir`, deduped by sha1, with a `.json` attribution sidecar) —
-   never hotlinked. The local path is stored in `icons.image_url`.
-6. When a new icon is approved for a saint that **already has followers**, the
-   pipeline writes a one-off `new_icon_added` event.
+   (`icons.download_dir`, deduped on disk by sha1, with a `.json` attribution
+   sidecar) — never hotlinked; the local path is stored in `icons.local_path`.
+   An icon is one *rendition*, identified by `(source, uri)` (last-write-wins);
+   `sha1`/`etag` are stored attributes, not merge keys (no cross-source dedup).
+6. **Recrawl.** None by default. A stored icon is re-fetched only once it's older
+   than `icons.recrawl_after` (0 = never), or when run with `--force-recrawl`. A
+   conditional GET (`If-None-Match` on the stored `etag`) skips re-downloading
+   unchanged bytes (304 Not Modified).
+7. When a new icon is approved, the pipeline **fans out** a one-off
+   `new_icon_added` event to **every** linked saint that already has followers.
+
+**Tags.** A shared `tags` vocabulary links to both icons (`icon_tags`) and saints
+(`saint_tags`) — many-to-many — so a tag like `theotokos` can sit on both and
+relate them. Populated via the storage API (`link_icon_tags` / `link_saint_tags`).
 
 ### Notifications
 

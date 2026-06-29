@@ -49,11 +49,12 @@ log = logging.getLogger("ortho_scraper.icon_pipeline")
 class IconRunStats:
     started: float = field(default_factory=time.monotonic)
     seen: int = 0
+    recrawl_skipped: int = 0     # within recrawl_after window — not re-fetched
     by_status: Counter = field(default_factory=Counter)
     approved_new: int = 0
     unresolved: int = 0          # image kept, saint-link left for review (no clean QID)
     image_downloaded: int = 0
-    image_deduped: int = 0
+    image_deduped: int = 0       # byte-identical on disk, or 304 Not Modified
     image_skipped: int = 0
     image_failed: int = 0
     events: int = 0
@@ -70,19 +71,29 @@ class IconPipeline:
         self._session = session
         self._db = db
         self._gate = LicenseGate()
-        # The rate limiter is injected via with_limiter() so image downloads
-        # share the same politeness budget as the adapters' API calls.
+        # Limiters are injected via with_limiters(): one per source (so a tight
+        # budget doesn't throttle the others) plus a default for shared calls
+        # (resolve_qid → Wikidata). _limiter is the *active* source limiter, set
+        # at the start of each source's _ingest and used for image downloads.
         self._limiter = None
-        self._http: Optional[_HttpJson] = None
+        self._default_limiter = None
+        self._source_limiters: Dict[str, object] = {}
+        self._http: Optional[_HttpJson] = None          # default (resolve_qid)
+        self._source_http: Dict[str, _HttpJson] = {}
         self._saint_cache: Dict[str, int] = {}
+        self._pending: set = set()                       # in-flight fan-out tasks
         self._stats = IconRunStats()
 
-    # The limiter is injected explicitly so downloads share the same budget as
-    # the adapters' API calls.
-    def with_limiter(self, limiter) -> "IconPipeline":
-        self._limiter = limiter
-        self._http = _HttpJson(self._session, limiter,
-                               self._cfg.http.max_retries, self._cfg.http.retry_backoff)
+    def with_limiters(self, source_limiters: Dict[str, object],
+                      default_limiter) -> "IconPipeline":
+        h = self._cfg.http
+        self._source_limiters = source_limiters
+        self._default_limiter = default_limiter
+        self._http = _HttpJson(self._session, default_limiter, h.max_retries, h.retry_backoff)
+        self._source_http = {
+            name: _HttpJson(self._session, lim, h.max_retries, h.retry_backoff)
+            for name, lim in source_limiters.items()
+        }
         return self
 
     async def run(self) -> None:
@@ -91,7 +102,7 @@ class IconPipeline:
             log.warning("icons.enabled is false; nothing to ingest.")
             return
         if self._http is None:
-            raise RuntimeError("IconPipeline.with_limiter() must be called before run().")
+            raise RuntimeError("IconPipeline.with_limiters() must be called before run().")
 
         self._stats = IconRunStats()
         log.info("=" * 64)
@@ -120,7 +131,7 @@ class IconPipeline:
                 log.warning("Source %r base_license changed -> re-flagged %d approved "
                             "icon(s) to pending_license_check.", sc.name, n)
 
-        adapters = build_adapters(icfg.sources, self._http)
+        adapters = build_adapters(icfg.sources, self._source_http)
         if not adapters:
             log.warning("No enabled icon sources; nothing to ingest.")
             return
@@ -128,48 +139,82 @@ class IconPipeline:
         for adapter in adapters:
             await self._ingest(adapter, source_objs[adapter.name], source_ids[adapter.name])
 
+        # Drain in-flight new_icon_added fan-out tasks before we summarize/return,
+        # so none are cancelled at shutdown and their exceptions surface.
+        if self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
+
         self._log_summary()
 
     async def _ingest(self, adapter, source: Source, source_id: int) -> None:
         log.info("Source %r: ingesting...", adapter.name)
+        # Use this source's own limiter for image downloads (its API calls already
+        # do, via the per-source _HttpJson inside the adapter).
+        self._limiter = self._source_limiters.get(adapter.name) or self._default_limiter
         n = 0
         async for record in adapter.records():
             n += 1
             self._stats.seen += 1
+
+            # Recrawl skip: a stored rendition still inside its recrawl_after
+            # window is left untouched (no download, no re-gate) — saves quota.
+            state = await self._db.get_icon_recrawl_state(source_id, record.uri)
+            if state and not self._cfg.force_recrawl and not self._is_expired(state):
+                self._stats.recrawl_skipped += 1
+                continue
+
             result = await self._decide(source, record)
             saint_id = await self._resolve_saint(record)
 
-            local_path = None
-            image_ref = None
+            local_path = sha1 = etag = None
             if result.status == APPROVED:
-                local_path = await self._materialize(record, result)
-                if local_path is None:
+                mat = await self._materialize(record, result, state)
+                if mat is None or mat[0] is None:
                     # An approved record with no servable image is useless and
                     # could leak a hotlink — fail closed to quarantine instead.
                     result = GateResult(status=QUARANTINED, reason="image_unavailable")
                 else:
-                    image_ref = local_path
+                    local_path, sha1, etag = mat
 
             res = await self._db.store_icon(IconRow(
+                source_id=source_id,
+                uri=record.uri,
                 title=record.title,
-                image_source_id=source_id,
-                image_license=result.license or "",
-                attribution_text=result.attribution or "",
-                source_record_id=record.source_record_id,
                 crawl_status=result.status,
-                saint_id=saint_id,
-                image_url=image_ref,
+                license=result.license or "",
+                attribution=result.attribution or "",
+                source_record_id=record.source_record_id,
+                sha1=sha1,
+                etag=etag,
                 description=record.description,
-                veneration_date=None,        # no verified-licensed source yet (PRD §7)
                 quarantine_reason=result.reason,
                 local_path=local_path,
             ))
+            # Link the auto-resolved saint (0 or 1) BEFORE fan-out so the task
+            # reads a committed icon_saints row (the "committed first" constraint).
+            if saint_id is not None:
+                await self._db.link_icon_saint(res.icon_id, saint_id)
             self._stats.by_status[result.status] += 1
             if res.newly_approved:
                 self._stats.approved_new += 1
-                await self._maybe_new_icon_event(saint_id, res.icon_id)
+                self._spawn_fanout(res.icon_id)
             log.info("[%s %d] %-12s %s", adapter.name, n, result.status, record.title)
         log.info("Source %r: processed %d record(s).", adapter.name, n)
+
+    def _is_expired(self, state: dict) -> bool:
+        """True if a stored icon is due for mandatory recrawl.
+
+        recrawl_after == 0 → never auto-recrawl (recrawl on demand only).
+        """
+        after = self._cfg.recrawl_after
+        if not after:
+            return False
+        last = state.get("last_crawled")
+        if last is None:
+            return True
+        if last.tzinfo is None:                 # some backends hand back naive UTC
+            last = last.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) >= last + after
 
     async def _decide(self, source: Source, record: RawRecord) -> GateResult:
         """Precedence: per-record override > per-type policy > automated gate."""
@@ -219,31 +264,58 @@ class IconPipeline:
         self._saint_cache[name] = saint_id
         return saint_id
 
-    async def _maybe_new_icon_event(self, saint_id: Optional[int], icon_id: int) -> None:
-        if saint_id is None:
-            return
-        if await self._db.count_followers("saint", saint_id) <= 0:
-            return
-        # UTC to match notifications_sent timestamps (which are UTC), so the
-        # notify job's same-day dedup compares like with like.
-        today = datetime.now(timezone.utc).date().isoformat()
-        event_id = await self._db.record_event("saint", saint_id, "new_icon_added", today)
-        if event_id is not None:
-            self._stats.events += 1
-            log.info("new_icon_added event for saint %d (icon %d).", saint_id, icon_id)
+    def _spawn_fanout(self, icon_id: int) -> None:
+        """Offload new_icon_added fan-out to a background task (not an OS thread —
+        the DB driver is async). Hold a ref so it isn't GC'd; run() gathers them."""
+        task = asyncio.create_task(self._fan_out_events(icon_id))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
-    async def _materialize(self, record: RawRecord, result: GateResult) -> Optional[str]:
+    async def _fan_out_events(self, icon_id: int) -> None:
+        """Write a new_icon_added event for every linked saint that has followers.
+
+        An icon may depict several saints (m2m); each followed saint gets an
+        event. The notify job's once-per-user-per-day dedup keeps a user who
+        follows two of them from being pinged twice for the same day.
+        """
+        try:
+            saint_ids = await self._db.linked_saints(icon_id)
+            # UTC to match notifications_sent timestamps, so the notify job's
+            # same-day dedup compares like with like.
+            today = datetime.now(timezone.utc).date().isoformat()
+            for saint_id in saint_ids:
+                if await self._db.count_followers("saint", saint_id) <= 0:
+                    continue
+                event_id = await self._db.record_event(
+                    "saint", saint_id, "new_icon_added", today)
+                if event_id is not None:
+                    self._stats.events += 1
+                    log.info("new_icon_added event for saint %d (icon %d).",
+                             saint_id, icon_id)
+        except Exception as exc:  # noqa: BLE001 - a fan-out hiccup must not kill the run
+            log.warning("new_icon_added fan-out failed for icon %d: %s", icon_id, exc)
+
+    async def _materialize(self, record: RawRecord, result: GateResult,
+                           prior: Optional[dict]):
         """Fetch the approved image into content-addressed storage; write a sidecar.
 
-        Returns the local path, or None if the image can't be obtained / is too
-        large. Files are deduplicated by sha1 of their bytes.
+        Returns ``(local_path, sha1, etag)``, or None if the image can't be
+        obtained / is too large. Files are content-addressed by sha1 (identical
+        bytes share one file on disk). On a recrawl, a conditional GET against the
+        stored ``etag`` lets the server answer 304 Not Modified — then we reuse
+        the prior bytes/path instead of re-downloading.
         """
+        prior = prior or {}
         try:
             if record.local_source_path:
                 data = await asyncio.to_thread(_read_bytes, record.local_source_path)
                 ext = os.path.splitext(record.local_source_path)[1].lower()
+                etag = None
             elif record.image_url:
-                data = await self._download(record.image_url)
+                data, etag = await self._download(record.image_url, prior.get("etag"))
+                if data is None:                      # 304 Not Modified — unchanged
+                    self._stats.image_deduped += 1
+                    return prior.get("local_path"), prior.get("sha1"), prior.get("etag")
                 ext = os.path.splitext(urlparse(record.image_url).path)[1].lower() or ".img"
             else:
                 return None
@@ -267,13 +339,19 @@ class IconPipeline:
             await asyncio.to_thread(_write_bytes, dest, data)
             self._stats.image_downloaded += 1
         await self._write_sidecar(dest, record, result)
-        return dest
+        return dest, sha1, etag
 
-    async def _download(self, url: str) -> bytes:
+    async def _download(self, url: str, prior_etag: Optional[str] = None):
+        """Download bytes, returning ``(data, etag)``. With a prior etag, sends a
+        conditional GET; a 304 returns ``(None, prior_etag)`` (caller reuses)."""
+        headers = {"If-None-Match": prior_etag} if prior_etag else {}
         async with self._limiter:
-            async with self._session.get(url) as resp:
+            async with self._session.get(url, headers=headers) as resp:
+                if resp.status == 304:
+                    return None, prior_etag
                 resp.raise_for_status()
-                return await resp.read()
+                data = await resp.read()
+                return data, resp.headers.get("ETag")
 
     async def _write_sidecar(self, dest: str, record: RawRecord, result: GateResult) -> None:
         sidecar = dest + ".json"
@@ -299,8 +377,10 @@ class IconPipeline:
         st = s.by_status
         log.info("=" * 64)
         log.info("Icon ingest complete in %.1fs", s.elapsed())
-        log.info("  Records   : %d seen | %d approved, %d quarantined, %d rejected, %d pending",
-                 s.seen, st.get(APPROVED, 0), st.get(QUARANTINED, 0), st.get(REJECTED, 0),
+        log.info("  Records   : %d seen | %d recrawl-skipped (within window)", s.seen,
+                 s.recrawl_skipped)
+        log.info("  Verdicts  : %d approved, %d quarantined, %d rejected, %d pending",
+                 st.get(APPROVED, 0), st.get(QUARANTINED, 0), st.get(REJECTED, 0),
                  st.get("pending_license_check", 0))
         log.info("  Approvals : %d newly approved | %d saints linked | %d links unresolved",
                  s.approved_new, s.saints, s.unresolved)
@@ -316,6 +396,12 @@ def _describe_query(s) -> str:
         return f"queries={s.queries or ['icon']} (max {s.max_objects} objects)"
     if s.name == "wikimedia":
         return f"search_terms={s.search_terms or ['Orthodox icon']} (max {s.max_files} files)"
+    if s.name == "wikipedia":
+        cat = s.category or 'Category:Eastern Orthodox icons'
+        return f"category={cat!r} depth={s.subcat_depth} (max {s.max_files})"
+    if s.name == "wikiart":
+        key = "set" if s.api_key else "MISSING — will skip"
+        return f"queries={s.queries or ['icon']} (max {s.max_objects}); api_key {key}"
     if s.name == "iconsaint":
         return f"dataset_path={s.dataset_path or '(unset — will skip)'}"
     return ""

@@ -217,15 +217,26 @@ class IconSourceConfig:
     attribution_template: Optional[str] = None
     allowed_licenses: List[str] = field(default_factory=list)
     notes: Optional[str] = None
-    # Met adapter
+    # Met / WikiArt adapters
     queries: List[str] = field(default_factory=list)
     max_objects: int = 200
     # Wikimedia adapter
     search_terms: List[str] = field(default_factory=list)
     max_files: int = 200
+    # Wikipedia-category adapter: walk a category's article members, take each
+    # article's lead image (icon), gate it by its Commons license.
+    category: str = ""
+    subcat_depth: int = 0
     # ICONSAINT adapter (local dataset)
     dataset_path: str = ""
     manifest: str = ""
+    # WikiArt adapter: secret via HOCON env subst (api_key = ${?WIKIART_API_KEY}).
+    api_key: str = ""
+    # Per-source politeness. Each source gets its own limiter so a tight budget
+    # (WikiArt: 400/hr) never throttles the others. hourly_cap > 0 adds a second
+    # token bucket enforcing requests-per-hour alongside requests_per_second.
+    rate_limit: "RateLimitConfig" = field(default_factory=lambda: RateLimitConfig())
+    hourly_cap: int = 0
 
 
 @dataclass
@@ -297,6 +308,11 @@ class IconsConfig:
     sources: Dict[str, IconSourceConfig] = field(default_factory=dict)
     rate_limit: "RateLimitConfig" = field(default_factory=lambda: RateLimitConfig())
     http: "HttpConfig" = field(default_factory=lambda: HttpConfig())
+    # Mandatory-recrawl window: a stored icon is re-fetched only once it's older
+    # than this (0 = never auto-recrawl; recrawl on demand via --force-recrawl).
+    recrawl_after: timedelta = timedelta(0)
+    # Runtime override set from the CLI flag; not read from the config file.
+    force_recrawl: bool = False
 
     def enabled_sources(self) -> List[IconSourceConfig]:
         return [s for s in self.sources.values() if s.enabled]
@@ -393,9 +409,15 @@ def _load_attribution(conf) -> AttributionConfig:
     )
 
 
-def _load_icon_source(name: str, node) -> IconSourceConfig:
+def _load_icon_source(name: str, node, default_rl: "RateLimitConfig") -> IconSourceConfig:
     if node is None:
-        return IconSourceConfig(name=name)
+        return IconSourceConfig(name=name, rate_limit=default_rl)
+    rl = node.get("rate_limit", {})
+    rate_limit = RateLimitConfig(
+        requests_per_second=float(rl.get("requests_per_second", default_rl.requests_per_second)),
+        burst=int(rl.get("burst", default_rl.burst)),
+        max_concurrency=int(rl.get("max_concurrency", default_rl.max_concurrency)),
+    )
     return IconSourceConfig(
         name=name,
         enabled=bool(node.get("enabled", False)),
@@ -409,8 +431,14 @@ def _load_icon_source(name: str, node) -> IconSourceConfig:
         max_objects=int(node.get("max_objects", 200)),
         search_terms=[str(x) for x in node.get("search_terms", [])],
         max_files=int(node.get("max_files", 200)),
+        category=str(node.get("category", "")),
+        subcat_depth=int(node.get("subcat_depth", 0)),
         dataset_path=expand_path(str(node.get("dataset_path", ""))),
         manifest=str(node.get("manifest", "")),
+        # HOCON resolves ${?WIKIART_API_KEY} from the environment; empty if unset.
+        api_key=str(node.get("api_key", "") or ""),
+        rate_limit=rate_limit,
+        hourly_cap=int(node.get("hourly_cap", 0)),
     )
 
 
@@ -420,25 +448,27 @@ def _load_icons(conf) -> IconsConfig:
         return IconsConfig()
     rl = node.get("rate_limit", {})
     http = node.get("http", {})
+    default_rl = RateLimitConfig(
+        requests_per_second=float(rl.get("requests_per_second", 2.0)),
+        burst=int(rl.get("burst", 4)),
+        max_concurrency=int(rl.get("max_concurrency", 4)),
+    )
     sources_node = node.get("sources", {})
     sources: Dict[str, IconSourceConfig] = {}
     for name in sources_node:  # iterating a ConfigTree yields its keys
-        sources[name] = _load_icon_source(name, sources_node[name])
+        sources[name] = _load_icon_source(name, sources_node[name], default_rl)
     return IconsConfig(
         enabled=bool(node.get("enabled", False)),
         download_dir=expand_path(str(node.get("download_dir", "icons"))),
         max_file_size=parse_size(node.get("max_file_size", "25 MB")),
         sources=sources,
-        rate_limit=RateLimitConfig(
-            requests_per_second=float(rl.get("requests_per_second", 2.0)),
-            burst=int(rl.get("burst", 4)),
-            max_concurrency=int(rl.get("max_concurrency", 4)),
-        ),
+        rate_limit=default_rl,
         http=HttpConfig(
             timeout=float(http.get("timeout", 30.0)),
             max_retries=int(http.get("max_retries", 3)),
             retry_backoff=float(http.get("retry_backoff", 1.0)),
         ),
+        recrawl_after=parse_duration(node.get("recrawl_after", "0")),
     )
 
 

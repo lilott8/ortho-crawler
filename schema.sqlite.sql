@@ -106,28 +106,59 @@ CREATE TABLE IF NOT EXISTS saint_claims (
 );
 CREATE INDEX IF NOT EXISTS saint_claims_saint_idx ON saint_claims (saint_id);
 
+-- An icon is one *rendition* (one distinct image). Identity is (source_id, uri),
+-- last-write-wins; sha1/etag are stored attributes, never merge keys. Licensing
+-- lives on the row (one source per rendition); saint links are m2m. The old-shape
+-- icons table is dropped in apply_schema (guarded; no prod data) before this runs.
 CREATE TABLE IF NOT EXISTS icons (
-    id                    INTEGER  PRIMARY KEY AUTOINCREMENT,
-    saint_id              INTEGER  REFERENCES saints(id),
-    title                 TEXT     NOT NULL,
-    image_url             TEXT,                            -- local/CDN copy, never hotlinked
-    image_source_id       INTEGER  NOT NULL REFERENCES sources(id),
-    image_license         TEXT     NOT NULL,
-    attribution_text      TEXT     NOT NULL,
-    description           TEXT,
-    description_source_id INTEGER  REFERENCES sources(id),
-    veneration_date       TEXT,                            -- MM-DD, nullable
-    source_record_id      TEXT,
-    crawl_status          TEXT     NOT NULL DEFAULT 'pending_license_check'
+    id                INTEGER  PRIMARY KEY AUTOINCREMENT,
+    source_id         INTEGER  NOT NULL REFERENCES sources(id),
+    uri               TEXT     NOT NULL,                    -- stable origin: image URL or local path
+    source_record_id  TEXT,                                 -- original id (metadata, not identity)
+    sha1              TEXT,                                 -- content hash of stored bytes
+    etag              TEXT,                                 -- HTTP validator for conditional recrawl
+    title             TEXT     NOT NULL,
+    description       TEXT,
+    license           TEXT     NOT NULL DEFAULT '',         -- '' until approved
+    attribution       TEXT     NOT NULL DEFAULT '',
+    crawl_status      TEXT     NOT NULL DEFAULT 'pending_license_check'
         CHECK (crawl_status IN ('pending_license_check','approved','quarantined','rejected')),
-    quarantine_reason     TEXT,
-    local_path            TEXT,
-    created_at            TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at            TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (image_source_id, source_record_id)
+    quarantine_reason TEXT,
+    local_path        TEXT,
+    last_crawled      TEXT,                                 -- last fetch; drives recrawl_after expiry
+    created_at        TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at        TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (source_id, uri)
 );
-CREATE INDEX IF NOT EXISTS icons_status_idx ON icons (crawl_status);
-CREATE INDEX IF NOT EXISTS icons_saint_idx  ON icons (saint_id);
+CREATE INDEX IF NOT EXISTS icons_status_idx       ON icons (crawl_status);
+CREATE INDEX IF NOT EXISTS icons_last_crawled_idx ON icons (last_crawled);
+
+-- Shared tag vocabulary, applied to both icons and saints (m2m below).
+CREATE TABLE IF NOT EXISTS tags (
+    id   INTEGER  PRIMARY KEY AUTOINCREMENT,
+    name TEXT     NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS icon_saints (
+    icon_id  INTEGER  NOT NULL REFERENCES icons(id) ON DELETE CASCADE,
+    saint_id INTEGER  NOT NULL REFERENCES saints(id),
+    PRIMARY KEY (icon_id, saint_id)
+);
+CREATE INDEX IF NOT EXISTS icon_saints_saint_idx ON icon_saints (saint_id);
+
+CREATE TABLE IF NOT EXISTS icon_tags (
+    icon_id INTEGER  NOT NULL REFERENCES icons(id) ON DELETE CASCADE,
+    tag_id  INTEGER  NOT NULL REFERENCES tags(id),
+    PRIMARY KEY (icon_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS icon_tags_tag_idx ON icon_tags (tag_id);
+
+CREATE TABLE IF NOT EXISTS saint_tags (
+    saint_id INTEGER  NOT NULL REFERENCES saints(id) ON DELETE CASCADE,
+    tag_id   INTEGER  NOT NULL REFERENCES tags(id),
+    PRIMARY KEY (saint_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS saint_tags_tag_idx ON saint_tags (tag_id);
 
 CREATE TABLE IF NOT EXISTS users (
     id          INTEGER  PRIMARY KEY AUTOINCREMENT,
