@@ -72,13 +72,39 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS saints (
     id              INTEGER  PRIMARY KEY AUTOINCREMENT,
     canonical_name  TEXT     NOT NULL UNIQUE,
+    qid             TEXT,                                  -- Wikidata QID, identity anchor; NULL = needs-review
+    description     TEXT,                                  -- CC0 Wikidata one-liner (core data, no attribution)
     alt_names       TEXT,                                  -- JSON array, for search
-    feast_day       TEXT,                                  -- MM-DD, nullable
+    feast_day       TEXT,                                  -- JSON array of MM-DD (multi-valued), nullable
     bio_text        TEXT,
     bio_source_id   INTEGER  REFERENCES sources(id),
     bio_license     TEXT,                                  -- NULL = do not serve bio_text
     created_at      TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- Unique only among non-NULL qids (SQLite treats NULLs as distinct), so any
+-- number of needs-review saints can coexist while resolved ones stay 1:1.
+CREATE UNIQUE INDEX IF NOT EXISTS saints_qid_idx ON saints (qid);
+
+-- The additive claims ledger: one row per (saint, field, source). Reducers fold
+-- these into the materialized saints.* columns. A claim with license IS NULL is
+-- stored for audit but is NOT servable (fail-closed); fact fields (feast_day)
+-- are servable without a license. Images are NOT claims — they live in `icons`.
+-- UNIQUE includes `value` so a source may contribute many values to a
+-- multi-valued field (alt_names). Scalar fields stay single because the writer
+-- (set_claims) deletes the source's prior rows before inserting.
+CREATE TABLE IF NOT EXISTS saint_claims (
+    id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+    saint_id    INTEGER  NOT NULL REFERENCES saints(id),
+    field       TEXT     NOT NULL,                         -- 'bio', 'feast_day', 'alt_names', ...
+    value       TEXT     NOT NULL,
+    source_id   INTEGER  NOT NULL REFERENCES sources(id),
+    weight      INTEGER  NOT NULL DEFAULT 0,
+    license     TEXT,                                      -- NULL = uncleared, not servable
+    attribution TEXT,
+    observed_at TEXT     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (saint_id, field, source_id, value)
+);
+CREATE INDEX IF NOT EXISTS saint_claims_saint_idx ON saint_claims (saint_id);
 
 CREATE TABLE IF NOT EXISTS icons (
     id                    INTEGER  PRIMARY KEY AUTOINCREMENT,

@@ -26,6 +26,7 @@ import asyncio
 import csv
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Dict, List, Optional
 
@@ -41,6 +42,24 @@ MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objec
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff", ".webp", ".bmp"}
+
+# Conservative saint-name guess from a Met/Commons title: only fires on an
+# explicit "Saint/St./Holy <Name…>" phrase. It's a low-trust hint — the pipeline
+# resolves it to a QID and links only to an already-seeded saint, so a wrong
+# guess simply fails to link (the image is still stored).
+_SAINT_HINT_RE = re.compile(
+    r"\b(?:Saint|St\.?|Holy)\s+([A-Z][a-zA-Z]+(?:\s+(?:of\s+|the\s+)?[A-Z][a-zA-Z]+){0,3})")
+
+
+def guess_saint_name(title: Optional[str]) -> Optional[str]:
+    """Best-effort saint label from an image title, or None. Conservative on
+    purpose; downstream QID resolution + existing-saint linkage make it safe."""
+    if not title:
+        return None
+    text = re.sub(r"^File:", "", title)
+    text = re.sub(r"\.\w{3,4}$", "", text)       # drop a file extension
+    m = _SAINT_HINT_RE.search(text)
+    return m.group(0).strip() if m else None
 
 
 @dataclass
@@ -162,11 +181,12 @@ class MetAdapter(SourceAdapter):
                 if not image:
                     continue  # nothing servable to ingest
                 emitted += 1
+                title = obj.get("title") or f"Met object {oid}"
                 yield RawRecord(
                     source=self.name,
                     source_record_id=str(obj.get("objectID", oid)),
-                    title=obj.get("title") or f"Met object {oid}",
-                    saint_name=None,  # Met objects are not saint-labeled
+                    title=title,
+                    saint_name=guess_saint_name(title),   # low-trust hint, link-only
                     description=obj.get("objectName") or obj.get("medium"),
                     image_url=image,
                     license_signal={
@@ -233,7 +253,7 @@ class WikimediaAdapter(SourceAdapter):
                         source=self.name,
                         source_record_id=str(page.get("pageid") or title),
                         title=title,
-                        saint_name=None,
+                        saint_name=guess_saint_name(title),   # low-trust hint, link-only
                         description=(ext.get("ImageDescription", {}) or {}).get("value"),
                         image_url=ii.get("url"),
                         license_signal={

@@ -229,6 +229,61 @@ class IconSourceConfig:
 
 
 @dataclass
+class LicensePolicy:
+    """A coarse, per-type licensing override (looser than the per-record DB
+    ``license_overrides``). Matches by ``target_type`` plus optional ``source``
+    and ``field`` (omitted = wildcard); most-specific match wins. An ``approved``
+    policy still carries attribution (a default is applied if none is given) —
+    it can widen what's cleared, never drop attribution.
+    """
+    target_type: str                  # 'saint' | 'icon'
+    decision: str                     # 'approved' | 'rejected'
+    source: Optional[str] = None
+    field: Optional[str] = None
+    license: Optional[str] = None
+    attribution: Optional[str] = None
+
+    def specificity(self) -> int:
+        return int(self.source is not None) + int(self.field is not None)
+
+    def matches(self, target_type: str, source: Optional[str],
+                field: Optional[str]) -> bool:
+        if self.target_type != target_type:
+            return False
+        if self.source is not None and self.source != source:
+            return False
+        if self.field is not None and self.field != field:
+            return False
+        return True
+
+
+def select_policy(policies, target_type: str, source: Optional[str],
+                  field: Optional[str]):
+    """Return the most-specific matching policy, or None. Ties keep config order."""
+    best = None
+    for p in policies:
+        if p.matches(target_type, source, field) and (
+                best is None or p.specificity() > best.specificity()):
+            best = p
+    return best
+
+
+@dataclass
+class Corrections:
+    """Operator-curated corrections applied on each run (the needs-review
+    "workflow", version-controlled in config — the audit trail). For the
+    high-value few that automation can't resolve; `--mode review` lists candidates
+    as ready-to-edit stubs.
+    """
+    saint_qid: Dict[str, str] = field(default_factory=dict)        # display name -> QID
+    feast: Dict[str, List[str]] = field(default_factory=dict)      # QID -> [MM-DD]
+    owiki_qid: Dict[str, str] = field(default_factory=dict)        # OrthodoxWiki title -> QID
+
+    def __bool__(self) -> bool:
+        return bool(self.saint_qid or self.feast or self.owiki_qid)
+
+
+@dataclass
 class IconsConfig:
     """Configuration for the Icon & Saints ingestion pipeline + notifications.
 
@@ -254,6 +309,12 @@ class SaintsConfig:
     wikipedia_articles: List[str] = field(
         default_factory=lambda: ["List of Eastern Orthodox saints"])
     max_records: int = 500
+    # Weight of Wikipedia bio claims in the per-field reducer. Wikipedia is the
+    # content spine, so it outranks enrichment sources by default.
+    wikipedia_weight: int = 100
+    # Weight of OrthodoxWiki bio claims (enrichment) — below Wikipedia, so it only
+    # wins a saint's bio when Wikipedia has none. 0 disables the enrichment pass.
+    orthodoxwiki_weight: int = 50
 
 
 @dataclass
@@ -288,6 +349,8 @@ class Config:
     database: DatabaseConfig
     icons: IconsConfig = field(default_factory=IconsConfig)
     saints: SaintsConfig = field(default_factory=SaintsConfig)
+    license_policies: List[LicensePolicy] = field(default_factory=list)
+    corrections: Corrections = field(default_factory=Corrections)
 
 
 def _policy_from(node) -> MediaPolicy:
@@ -379,6 +442,41 @@ def _load_icons(conf) -> IconsConfig:
     )
 
 
+def _load_license_policies(conf) -> List[LicensePolicy]:
+    node = conf.get("license_policies", None)
+    if not node:
+        return []
+    policies: List[LicensePolicy] = []
+    for item in node:  # a HOCON list of objects
+        policies.append(LicensePolicy(
+            target_type=str(item["target_type"]),
+            decision=str(item["decision"]),
+            source=(str(item["source"]) if item.get("source", None) is not None else None),
+            field=(str(item["field"]) if item.get("field", None) is not None else None),
+            license=(str(item["license"]) if item.get("license", None) is not None else None),
+            attribution=(str(item["attribution"])
+                         if item.get("attribution", None) is not None else None),
+        ))
+    return policies
+
+
+def _load_corrections(conf) -> Corrections:
+    node = conf.get("corrections", None)
+    if not node:
+        return Corrections()
+    saint_qid, feast, owiki_qid = {}, {}, {}
+    for item in node.get("saint_qid", []) or []:
+        if item.get("name") and item.get("qid"):
+            saint_qid[str(item["name"])] = str(item["qid"])
+    for item in node.get("feast", []) or []:
+        if item.get("qid") and item.get("days"):
+            feast[str(item["qid"])] = [str(d) for d in item["days"]]
+    for item in node.get("owiki_qid", []) or []:
+        if item.get("title") and item.get("qid"):
+            owiki_qid[str(item["title"])] = str(item["qid"])
+    return Corrections(saint_qid=saint_qid, feast=feast, owiki_qid=owiki_qid)
+
+
 def _load_saints(conf) -> SaintsConfig:
     node = conf.get("saints", None)
     if node is None:
@@ -389,6 +487,8 @@ def _load_saints(conf) -> SaintsConfig:
         wikipedia_articles=[str(x) for x in node.get("wikipedia_articles",
                                                        d.wikipedia_articles)],
         max_records=int(node.get("max_records", d.max_records)),
+        wikipedia_weight=int(node.get("wikipedia_weight", d.wikipedia_weight)),
+        orthodoxwiki_weight=int(node.get("orthodoxwiki_weight", d.orthodoxwiki_weight)),
     )
 
 
@@ -435,4 +535,6 @@ def load_config(path: str) -> Config:
     )
 
     return Config(scraper=scraper, database=database, icons=_load_icons(conf),
-                  saints=_load_saints(conf))
+                  saints=_load_saints(conf),
+                  license_policies=_load_license_policies(conf),
+                  corrections=_load_corrections(conf))
