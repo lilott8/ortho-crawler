@@ -232,6 +232,10 @@ class IconSourceConfig:
     manifest: str = ""
     # WikiArt adapter: secret via HOCON env subst (api_key = ${?WIKIART_API_KEY}).
     api_key: str = ""
+    # Openverse adapter: passed through as query params (also cuts crawl budget
+    # spent on records the gate would quarantine anyway).
+    filter_dead: bool = True
+    mature: bool = False
     # Per-source politeness. Each source gets its own limiter so a tight budget
     # (WikiArt: 400/hr) never throttles the others. hourly_cap > 0 adds a second
     # token bucket enforcing requests-per-hour alongside requests_per_second.
@@ -437,6 +441,8 @@ def _load_icon_source(name: str, node, default_rl: "RateLimitConfig") -> IconSou
         manifest=str(node.get("manifest", "")),
         # HOCON resolves ${?WIKIART_API_KEY} from the environment; empty if unset.
         api_key=str(node.get("api_key", "") or ""),
+        filter_dead=bool(node.get("filter_dead", True)),
+        mature=bool(node.get("mature", False)),
         rate_limit=rate_limit,
         hourly_cap=int(node.get("hourly_cap", 0)),
     )

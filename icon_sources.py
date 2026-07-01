@@ -17,6 +17,8 @@ Sources (see PRD §2):
   * ``iconsaint`` — local copy of the ICONSAINT GitHub dataset (blanket CC BY,
     images-only). Read from a configured ``dataset_path`` so the required
     human license check happens before bytes are pointed at the pipeline.
+  * ``openverse`` — Openverse aggregated image search (anonymous access), a
+    per-file ``license`` code checked against the source's allowed_licenses.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objec
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIART_SEARCH_URL = "https://www.wikiart.org/en/api/2/PaintingSearch"
+OPENVERSE_SEARCH_URL = "https://api.openverse.org/v1/images/"
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff", ".webp", ".bmp"}
 
@@ -536,6 +539,89 @@ class IconsaintAdapter(SourceAdapter):
         )
 
 
+class OpenverseAdapter(SourceAdapter):
+    """Openverse: aggregated openly-licensed image search (anonymous access).
+
+    Openverse has no icon-specific taxonomy — it's free-text search over
+    metadata aggregated from many providers (Wikimedia Commons, Flickr, museum
+    collections, etc.), so scope comes entirely from the configured query terms
+    (``queries``, e.g. "Byzantine icon", "Orthodox icon"). ``allowed_licenses``
+    is passed to the API as a ``license=`` filter (saves crawl budget) AND still
+    checked by the gate (defense in depth, as with the Wikimedia adapter).
+
+    Each result already carries a ready-made ``attribution`` string built from
+    the original creator/license/source, which the gate uses as the default
+    attribution rather than resynthesizing one.
+    """
+
+    name = "openverse"
+
+    def __init__(self, cfg: IconSourceConfig, http: _HttpJson):
+        self._cfg = cfg
+        self._http = http
+
+    async def records(self) -> AsyncIterator[RawRecord]:
+        terms = self._cfg.queries or ["Byzantine icon"]
+        license_param = ",".join(self._cfg.allowed_licenses) or None
+        seen: set = set()
+        emitted = 0
+        for term in terms:
+            if emitted >= self._cfg.max_objects:
+                break
+            before = emitted
+            page = 1
+            while emitted < self._cfg.max_objects:
+                params = {
+                    "q": term,
+                    "page": page,
+                    "page_size": 20,
+                    "filter_dead": str(self._cfg.filter_dead).lower(),
+                    "mature": str(self._cfg.mature).lower(),
+                }
+                if license_param:
+                    params["license"] = license_param
+                try:
+                    data = await self._http.get(OPENVERSE_SEARCH_URL, params)
+                except aiohttp.ClientError as exc:
+                    # Permanent (4xx) or retry-exhausted (5xx, already warned by
+                    # _HttpJson): skip the rest of this term, not the whole crawl.
+                    log.warning("[openverse] query %r page %d failed: %s", term, page, exc)
+                    break
+                results = data.get("results") or []
+                if not results:
+                    break
+                for item in results:
+                    if emitted >= self._cfg.max_objects:
+                        break
+                    rec_id = item.get("id")
+                    url = item.get("url")
+                    if not rec_id or not url or rec_id in seen:
+                        continue
+                    seen.add(rec_id)
+                    emitted += 1
+                    title = item.get("title") or f"Openverse {rec_id}"
+                    yield RawRecord(
+                        source=self.name,
+                        source_record_id=str(rec_id),
+                        title=title,
+                        uri=url,                              # image URL = rendition identity
+                        saint_name=guess_saint_name(title),   # low-trust hint, link-only
+                        description=item.get("foreign_landing_url"),
+                        image_url=url,
+                        license_signal={
+                            "license": item.get("license"),
+                            "attribution": item.get("attribution"),
+                            "author": item.get("creator") or None,
+                        },
+                        raw=item,
+                    )
+                if page >= int(data.get("page_count") or 0):
+                    break
+                page += 1
+            log.info("[openverse] query %r -> %d result(s).", term, emitted - before)
+        log.info("[openverse] emitted %d record(s) total.", emitted)
+
+
 def _strip_html(value: Optional[str]) -> Optional[str]:
     """Commons ``extmetadata`` often wraps artist/desc in HTML; flatten it."""
     if not value:
@@ -554,7 +640,7 @@ def build_adapters(sources: Dict[str, IconSourceConfig],
     source has its own limiter, so a tight budget doesn't throttle the others).
     """
     adapters: List[SourceAdapter] = []
-    for name in ("met_api", "wikimedia", "wikipedia", "wikiart", "iconsaint"):
+    for name in ("met_api", "wikimedia", "wikipedia", "wikiart", "openverse", "iconsaint"):
         cfg = sources.get(name)
         if not cfg or not cfg.enabled:
             continue
@@ -567,6 +653,8 @@ def build_adapters(sources: Dict[str, IconSourceConfig],
             adapters.append(WikipediaCategoryAdapter(cfg, http))
         elif name == "wikiart":
             adapters.append(WikiArtAdapter(cfg, http))
+        elif name == "openverse":
+            adapters.append(OpenverseAdapter(cfg, http))
         elif name == "iconsaint":
             adapters.append(IconsaintAdapter(cfg))
     return adapters

@@ -100,6 +100,8 @@ class LicenseGate:
             return self._check_wikiart(source, record)
         if source.name == "iconsaint":
             return self._check_iconsaint(source, record)
+        if source.name == "openverse":
+            return self._check_openverse(source, record)
         return GateResult(status=REJECTED, reason="unknown_source")
 
     # -- WikiArt: stub — fail-closed until the license signal is known. ---------
@@ -168,3 +170,23 @@ class LicenseGate:
         )
         return GateResult(status=APPROVED, license=source.base_license,
                           attribution=attribution)
+
+    # -- Openverse: per-record license code against the allowlist. -------------
+    def _check_openverse(self, source: Source, record) -> GateResult:
+        lic = record.license_signal.get("license")
+        if lic and lic in source.allowed_licenses:
+            # Openverse always builds a correctly-sourced attribution string
+            # (creator/license/original source) for every result; prefer it over
+            # a synthesized default, but still let attribution_template override.
+            attribution = _render_attribution(
+                source.attribution_template,
+                default=record.license_signal.get("attribution"),
+                author=record.license_signal.get("author"),
+                license=lic,
+                source="Openverse",
+                source_record_id=record.source_record_id,
+                title=record.title,
+            )
+            return GateResult(status=APPROVED, license=lic, attribution=attribution)
+        return GateResult(status=QUARANTINED,
+                          reason=f"unrecognized_or_restrictive_license:{lic or 'none'}")
