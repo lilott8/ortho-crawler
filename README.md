@@ -93,6 +93,10 @@ Set `database.backend` to `"postgres"` or `"sqlite"`.
 # merged from Wikipedia and OrthodoxWiki via the claims ledger:
 ./.venv/bin/python main.py --config scraper.conf --mode saints
 
+# OrthodoxWiki enrichment only (skips the Wikipedia ingest phase; reuses
+# saints/pages already in the DB — handy after a fresh `--mode wiki` crawl):
+./.venv/bin/python main.py --config scraper.conf --mode enrich
+
 # Daily follower-notification job (feast/nameday/veneration/new-icon):
 ./.venv/bin/python main.py --config scraper.conf --mode notify
 
@@ -343,7 +347,8 @@ What a `--mode saints` run does:
    already crawled by `--mode wiki` — no extra crawl. Matches each page to an
    existing saint by name/alias, then by QID for misses, and contributes a
    lower-weight CC BY-SA 2.5 bio. It **only wins** a saint's bio slot when
-   Wikipedia has none.
+   Wikipedia has none. Run **`--mode enrich`** to redo just this phase (e.g.
+   after a fresh `--mode wiki` crawl) without re-fetching the Wikipedia roster.
 
 The run is logged per saint — `[saints N] <name> | qid=… bio=… feast=… alias=…
 desc=…` — with phase summaries and an end-of-run banner, so a long crawl is
@@ -359,8 +364,9 @@ contracts — that's by design.)
 
 Configure it in the `saints { … }` block of [`scraper.conf`](scraper.conf):
 `enabled`, `wikipedia_articles` (article **titles**, not URLs), `max_records`,
-and the source weights `wikipedia_weight` / `orthodoxwiki_weight`. Coarse,
-per-type licensing overrides live in the top-level `license_policies` list.
+the source weights `wikipedia_weight` / `orthodoxwiki_weight`, and `rate_limit`
+(politeness for the Wikipedia/Wikidata HTTP calls). Coarse, per-type licensing
+overrides live in the top-level `license_policies` list.
 
 ### Corrections & review (`--mode review`)
 
@@ -392,7 +398,7 @@ answer to "what do we actually have, and where are the gaps."
 
 | File | Purpose |
 | --- | --- |
-| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|saints\|notify\|stats\|review`. |
+| [`main.py`](main.py) | CLI entry point + run/loop orchestration; `--mode wiki\|icons\|saints\|enrich\|notify\|stats\|review`. |
 | [`config.py`](config.py) | HOCON loading + duration parsing into typed dataclasses. |
 | [`mediawiki.py`](mediawiki.py) | Async MediaWiki API client (category enumeration, content fetch). |
 | [`ratelimit.py`](ratelimit.py) | Token-bucket + concurrency limiter. |

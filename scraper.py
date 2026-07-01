@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import time
@@ -14,6 +13,7 @@ from typing import Dict, List, Optional, Set
 from urllib.parse import quote
 
 from config import Config
+from content_store import content_path, write_bytes, write_sidecar
 from storage import Storage, MediaRecord
 from licenses import detect_licenses, redistribution_level, best_license_name
 from mediawiki import BATCH_SIZE, MediaWikiClient
@@ -421,8 +421,7 @@ class Scraper:
             self._stats.media_failed += 1
             return None
 
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        await asyncio.to_thread(_write_bytes, dest, data)
+        await asyncio.to_thread(write_bytes, dest, data)
         await self._record_media(dest, meta)
         self._stats.media_downloaded += 1
         log.debug("Downloaded %r -> %s (%s)", meta.title, dest, _fmt_bytes(len(data)))
@@ -444,9 +443,6 @@ class Scraper:
             redistribution=level,
         ))
 
-        sidecar = dest + ".json"
-        if os.path.exists(sidecar):
-            return
         a = self._cfg.scraper.attribution
         record = {
             "title": meta.title,
@@ -465,8 +461,7 @@ class Scraper:
             "license_note": a.image_license_note,
             "description_wikitext": meta.description_wikitext,
         }
-        await asyncio.to_thread(_write_bytes, sidecar,
-                                json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8"))
+        await asyncio.to_thread(write_sidecar, dest + ".json", record)
 
     def _media_id(self, meta) -> str:
         """Content identity: the file's sha1, or a url hash when sha1 is absent."""
@@ -476,9 +471,4 @@ class Scraper:
         """Content-addressed path: <download_dir>/<media_id[:2]>/<media_id><ext>."""
         mid = self._media_id(meta)
         ext = os.path.splitext(meta.title)[1].lower()
-        return os.path.join(self._cfg.scraper.media.download_dir, mid[:2], mid + ext)
-
-
-def _write_bytes(path: str, data: bytes) -> None:
-    with open(path, "wb") as fh:
-        fh.write(data)
+        return content_path(self._cfg.scraper.media.download_dir, mid, ext)

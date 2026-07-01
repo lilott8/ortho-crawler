@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import time
@@ -37,6 +36,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from config import Config, select_policy
+from content_store import content_path, read_bytes, write_bytes, write_sidecar
 from icon_sources import RawRecord, _HttpJson, build_adapters
 from license_gate import APPROVED, GateResult, LicenseGate, QUARANTINED, REJECTED, Source
 from saint_sources import resolve_qid
@@ -308,7 +308,7 @@ class IconPipeline:
         prior = prior or {}
         try:
             if record.local_source_path:
-                data = await asyncio.to_thread(_read_bytes, record.local_source_path)
+                data = await asyncio.to_thread(read_bytes, record.local_source_path)
                 ext = os.path.splitext(record.local_source_path)[1].lower()
                 etag = None
             elif record.image_url:
@@ -331,12 +331,11 @@ class IconPipeline:
             return None
 
         sha1 = hashlib.sha1(data).hexdigest()
-        dest = os.path.join(self._cfg.download_dir, sha1[:2], sha1 + ext)
+        dest = content_path(self._cfg.download_dir, sha1, ext)
         if os.path.exists(dest):
             self._stats.image_deduped += 1
         else:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            await asyncio.to_thread(_write_bytes, dest, data)
+            await asyncio.to_thread(write_bytes, dest, data)
             self._stats.image_downloaded += 1
         await self._write_sidecar(dest, record, result)
         return dest, sha1, etag
@@ -354,9 +353,6 @@ class IconPipeline:
                 return data, resp.headers.get("ETag")
 
     async def _write_sidecar(self, dest: str, record: RawRecord, result: GateResult) -> None:
-        sidecar = dest + ".json"
-        if os.path.exists(sidecar):
-            return
         payload = {
             "title": record.title,
             "source": record.source,
@@ -368,9 +364,7 @@ class IconPipeline:
             "image_origin": record.image_url or record.local_source_path,
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
-        await asyncio.to_thread(
-            _write_bytes, sidecar,
-            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+        await asyncio.to_thread(write_sidecar, dest + ".json", payload)
 
     def _log_summary(self) -> None:
         s = self._stats
@@ -404,14 +398,6 @@ def _describe_query(s) -> str:
         return f"queries={s.queries or ['icon']} (max {s.max_objects}); api_key {key}"
     if s.name == "iconsaint":
         return f"dataset_path={s.dataset_path or '(unset — will skip)'}"
+    if s.name == "openverse":
+        return f"queries={s.queries or ['Byzantine icon']} (max {s.max_objects} objects)"
     return ""
-
-
-def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as fh:
-        return fh.read()
-
-
-def _write_bytes(path: str, data: bytes) -> None:
-    with open(path, "wb") as fh:
-        fh.write(data)

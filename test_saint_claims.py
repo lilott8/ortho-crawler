@@ -353,6 +353,28 @@ async def test_curated_feast_correction():
     await db.close()
 
 
+def test_http_calls_go_through_shared_retry_helper():
+    """Guard against the saint_sources.py timeout crash recurring: a bare
+    ``session.get()`` skips the retry/backoff + asyncio.TimeoutError handling
+    that icon_sources._HttpJson (and mediawiki.MediaWikiClient._get) provide,
+    so one slow response can kill an entire run. Only those two files — plus
+    icon_pipeline.py's byte-download (streaming/ETag, not JSON, guarded by a
+    broad except at its call site) — are allowed to call it directly.
+    """
+    allowed = {"mediawiki.py", "icon_sources.py", "icon_pipeline.py"}
+    here = os.path.dirname(os.path.abspath(__file__))
+    offenders = []
+    for name in os.listdir(here):
+        if name.endswith(".py") and name not in allowed and not name.startswith("test_"):
+            with open(os.path.join(here, name)) as fh:
+                if "session.get(" in fh.read():
+                    offenders.append(name)
+    assert not offenders, (
+        f"{offenders} call session.get() directly, bypassing retry/timeout "
+        "handling. Route through icon_sources._HttpJson instead (see how "
+        "saint_sources.py does it).")
+
+
 def test_corrections_config():
     from config import load_config
     conf = (
@@ -384,6 +406,7 @@ if __name__ == "__main__":
     test_feast_day_parse()
     test_guess_saint_name()
     test_wikitext_cleaner()
+    test_http_calls_go_through_shared_retry_helper()
     test_corrections_config()
     asyncio.run(test_storage())
     asyncio.run(test_coverage())

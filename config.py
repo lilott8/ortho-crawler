@@ -335,6 +335,10 @@ class SaintsConfig:
     # Weight of OrthodoxWiki bio claims (enrichment) — below Wikipedia, so it only
     # wins a saint's bio when Wikipedia has none. 0 disables the enrichment pass.
     orthodoxwiki_weight: int = 50
+    # Politeness for Wikipedia/Wikidata HTTP calls (article fetch + QID resolve).
+    # Conservative default; bumpable since these are light, non-bulk lookups.
+    rate_limit: "RateLimitConfig" = field(default_factory=lambda: RateLimitConfig(
+        requests_per_second=1.0, burst=2, max_concurrency=1))
 
 
 @dataclass
@@ -518,6 +522,12 @@ def _load_saints(conf) -> SaintsConfig:
     if node is None:
         return SaintsConfig()
     d = SaintsConfig()
+    rl = node.get("rate_limit", {})
+    rate_limit = RateLimitConfig(
+        requests_per_second=float(rl.get("requests_per_second", d.rate_limit.requests_per_second)),
+        burst=int(rl.get("burst", d.rate_limit.burst)),
+        max_concurrency=int(rl.get("max_concurrency", d.rate_limit.max_concurrency)),
+    )
     return SaintsConfig(
         enabled=bool(node.get("enabled", False)),
         wikipedia_articles=[str(x) for x in node.get("wikipedia_articles",
@@ -525,6 +535,7 @@ def _load_saints(conf) -> SaintsConfig:
         max_records=int(node.get("max_records", d.max_records)),
         wikipedia_weight=int(node.get("wikipedia_weight", d.wikipedia_weight)),
         orthodoxwiki_weight=int(node.get("orthodoxwiki_weight", d.orthodoxwiki_weight)),
+        rate_limit=rate_limit,
     )
 
 
