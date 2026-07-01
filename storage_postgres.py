@@ -187,7 +187,7 @@ class PostgresStorage(Storage):
     async def reflag_icons_for_source(self, source_id: int) -> int:
         status = await self._pool.execute(
             """UPDATE icons SET crawl_status = 'pending_license_check', updated_at = now()
-               WHERE image_source_id = $1 AND crawl_status = 'approved'""",
+               WHERE source_id = $1 AND crawl_status = 'approved'""",
             source_id,
         )
         return _affected(status)
@@ -218,37 +218,81 @@ class PostgresStorage(Storage):
             async with conn.transaction():
                 prior = await conn.fetchval(
                     """SELECT crawl_status FROM icons
-                       WHERE image_source_id = $1 AND source_record_id = $2""",
-                    row.image_source_id, row.source_record_id,
+                       WHERE source_id = $1 AND uri = $2""",
+                    row.source_id, row.uri,
                 )
                 icon_id = await conn.fetchval(
                     """
-                    INSERT INTO icons (saint_id, title, image_url, image_source_id,
-                                       image_license, attribution_text, description,
-                                       veneration_date, source_record_id, crawl_status,
-                                       quarantine_reason, local_path)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                    ON CONFLICT (image_source_id, source_record_id) DO UPDATE SET
-                        saint_id          = EXCLUDED.saint_id,
+                    INSERT INTO icons (source_id, uri, source_record_id, sha1, etag,
+                                       title, description, license, attribution,
+                                       crawl_status, quarantine_reason, local_path,
+                                       last_crawled)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+                    ON CONFLICT (source_id, uri) DO UPDATE SET
+                        source_record_id  = EXCLUDED.source_record_id,
+                        sha1              = EXCLUDED.sha1,
+                        etag              = EXCLUDED.etag,
                         title             = EXCLUDED.title,
-                        image_url         = EXCLUDED.image_url,
-                        image_license     = EXCLUDED.image_license,
-                        attribution_text  = EXCLUDED.attribution_text,
                         description       = EXCLUDED.description,
-                        veneration_date   = EXCLUDED.veneration_date,
+                        license           = EXCLUDED.license,
+                        attribution       = EXCLUDED.attribution,
                         crawl_status      = EXCLUDED.crawl_status,
                         quarantine_reason = EXCLUDED.quarantine_reason,
                         local_path        = EXCLUDED.local_path,
+                        last_crawled      = now(),
                         updated_at        = now()
                     RETURNING id
                     """,
-                    row.saint_id, row.title, row.image_url, row.image_source_id,
-                    row.image_license, row.attribution_text, row.description,
-                    row.veneration_date, row.source_record_id, row.crawl_status,
-                    row.quarantine_reason, row.local_path,
+                    row.source_id, row.uri, row.source_record_id, row.sha1, row.etag,
+                    row.title, row.description, row.license, row.attribution,
+                    row.crawl_status, row.quarantine_reason, row.local_path,
                 )
         newly_approved = row.crawl_status == "approved" and prior != "approved"
         return IconStoreResult(icon_id=icon_id, newly_approved=newly_approved)
+
+    async def get_icon_recrawl_state(self, source_id, uri):
+        row = await self._pool.fetchrow(
+            """SELECT last_crawled, etag, sha1, local_path FROM icons
+               WHERE source_id = $1 AND uri = $2""",
+            source_id, uri,
+        )
+        return dict(row) if row else None
+
+    async def bump_icon_crawled(self, source_id, uri, etag=None) -> None:
+        await self._pool.execute(
+            """UPDATE icons SET last_crawled = now(), updated_at = now(),
+                   etag = COALESCE($3, etag)
+               WHERE source_id = $1 AND uri = $2""",
+            source_id, uri, etag,
+        )
+
+    async def link_icon_saint(self, icon_id, saint_id) -> None:
+        await self._pool.execute(
+            """INSERT INTO icon_saints (icon_id, saint_id) VALUES ($1, $2)
+               ON CONFLICT DO NOTHING""",
+            icon_id, saint_id,
+        )
+
+    async def linked_saints(self, icon_id) -> List[int]:
+        rows = await self._pool.fetch(
+            "SELECT saint_id FROM icon_saints WHERE icon_id = $1", icon_id)
+        return [r["saint_id"] for r in rows]
+
+    async def link_icon_tags(self, icon_id, names) -> None:
+        await self._link_tags("icon_tags", "icon_id", icon_id, names)
+
+    async def link_saint_tags(self, saint_id, names) -> None:
+        await self._link_tags("saint_tags", "saint_id", saint_id, names)
+
+    async def _link_tags(self, table, col, owner_id, names) -> None:
+        for name in {n.strip() for n in names if n and n.strip()}:
+            tag_id = await self._pool.fetchval(
+                """INSERT INTO tags (name) VALUES ($1)
+                   ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                   RETURNING id""", name)
+            await self._pool.execute(
+                f"INSERT INTO {table} ({col}, tag_id) VALUES ($1, $2) "
+                f"ON CONFLICT DO NOTHING", owner_id, tag_id)
 
     async def count_followers(self, target_type, target_id) -> int:
         return await self._pool.fetchval(
@@ -276,13 +320,9 @@ class PostgresStorage(Storage):
                     LATERAL json_array_elements_text(s.feast_day::json) je
                WHERE s.feast_day IS NOT NULL AND left(s.feast_day, 1) = '['
                ON CONFLICT DO NOTHING""")
-        s2 = await self._pool.execute(
-            """INSERT INTO events (target_type, target_id, event_type, event_date)
-               SELECT 'icon', id, 'veneration_day', veneration_date FROM icons
-               WHERE veneration_date IS NOT NULL AND crawl_status = 'approved'
-               ON CONFLICT DO NOTHING""")
-        total = _affected(s1) + _affected(s2)
-        return total
+        # Icons no longer carry veneration_date (the renditions refactor dropped
+        # it — no verified-licensed source). Only saint feast days recur here.
+        return _affected(s1)
 
     async def due_recurring_events(self, today_md: str):
         rows = await self._pool.fetch(
@@ -390,9 +430,10 @@ class PostgresStorage(Storage):
                  (SELECT COUNT(*) FROM saints WHERE feast_day IS NOT NULL) AS saints_with_feast,
                  (SELECT COUNT(*) FROM icons) AS icons_total,
                  (SELECT COUNT(*) FROM icons WHERE crawl_status='approved') AS icons_approved,
-                 (SELECT COUNT(*) FROM icons WHERE saint_id IS NOT NULL) AS icons_linked,
-                 (SELECT COUNT(*) FROM icons
-                    WHERE saint_id IS NULL AND crawl_status='approved') AS icons_orphan,
+                 (SELECT COUNT(DISTINCT icon_id) FROM icon_saints) AS icons_linked,
+                 (SELECT COUNT(*) FROM icons i WHERE crawl_status='approved'
+                    AND NOT EXISTS (SELECT 1 FROM icon_saints s
+                                    WHERE s.icon_id = i.id)) AS icons_orphan,
                  (SELECT COUNT(*) FROM saint_claims) AS claims_total""")
         return dict(row)
 

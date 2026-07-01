@@ -43,19 +43,25 @@ class SourceState:
 
 @dataclass
 class IconRow:
-    """An icon record ready to persist (post-gate)."""
+    """An icon (one *rendition*) ready to persist (post-gate).
+
+    Identity is ``(source_id, uri)``; ``store_icon`` upserts on it (last-write-
+    wins). ``sha1``/``etag`` are stored attributes (byte-identity + HTTP recrawl
+    validator), never dedup/merge keys. Saint links are written separately via
+    :meth:`Storage.link_icon_saint` (m2m), not on this row.
+    """
+    source_id: int
+    uri: str                         # stable origin: image URL or local path
     title: str
-    image_source_id: int
-    image_license: str               # '' allowed only for non-approved rows
-    attribution_text: str            # '' allowed only for non-approved rows
-    source_record_id: str
     crawl_status: str                # license_gate.CRAWL_STATUSES
-    saint_id: Optional[int] = None
-    image_url: Optional[str] = None  # local/CDN path, never a hotlink
+    license: str = ""                # '' allowed only for non-approved rows
+    attribution: str = ""            # '' allowed only for non-approved rows
+    source_record_id: Optional[str] = None
+    sha1: Optional[str] = None
+    etag: Optional[str] = None
     description: Optional[str] = None
-    veneration_date: Optional[str] = None
     quarantine_reason: Optional[str] = None
-    local_path: Optional[str] = None
+    local_path: Optional[str] = None  # content-addressed file on disk
 
 
 @dataclass
@@ -144,11 +150,44 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     async def store_icon(self, row: IconRow) -> IconStoreResult:
-        """Upsert an icon (idempotent by source + source_record_id).
+        """Upsert an icon (idempotent by ``(source_id, uri)``, last-write-wins).
 
-        Returns the row id and whether it reached 'approved' for the first time
-        (drives new_icon_added events).
+        Stamps ``last_crawled`` to now. Returns the row id and whether it reached
+        'approved' for the first time (drives new_icon_added events).
         """
+
+    @abc.abstractmethod
+    async def get_icon_recrawl_state(self, source_id: int,
+                                     uri: str) -> Optional[dict]:
+        """Recrawl state for an icon, or None if not yet stored.
+
+        Shape: {last_crawled (datetime|None), etag, sha1, local_path}. Drives the
+        recrawl-skip decision (now < last_crawled + recrawl_after) and the
+        conditional GET (If-None-Match on the stored etag).
+        """
+
+    @abc.abstractmethod
+    async def bump_icon_crawled(self, source_id: int, uri: str,
+                                etag: Optional[str] = None) -> None:
+        """Stamp ``last_crawled`` = now (and etag if given) without rewriting the
+        row — the 304 Not Modified path of a conditional recrawl."""
+
+    @abc.abstractmethod
+    async def link_icon_saint(self, icon_id: int, saint_id: int) -> None:
+        """Link an icon to a saint (idempotent). Many-to-many; an icon may have
+        several saints and a saint many icons."""
+
+    @abc.abstractmethod
+    async def linked_saints(self, icon_id: int) -> List[int]:
+        """Saint ids linked to an icon (for new_icon_added fan-out)."""
+
+    @abc.abstractmethod
+    async def link_icon_tags(self, icon_id: int, names: List[str]) -> None:
+        """Upsert tags by name and link them to an icon (idempotent)."""
+
+    @abc.abstractmethod
+    async def link_saint_tags(self, saint_id: int, names: List[str]) -> None:
+        """Upsert tags by name and link them to a saint (idempotent)."""
 
     @abc.abstractmethod
     async def count_followers(self, target_type: str, target_id: int) -> int:

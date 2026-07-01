@@ -48,16 +48,32 @@ class TokenBucket:
 
 
 class RateLimiter:
-    """Token bucket + concurrency semaphore, usable as an async context manager."""
+    """One or more token buckets + a concurrency semaphore, as an async context
+    manager.
 
-    def __init__(self, requests_per_second: float, burst: int, max_concurrency: int):
-        self._bucket = TokenBucket(requests_per_second, burst)
+    A single bucket is the common case (sustained rate + burst). Pass ``buckets``
+    to enforce *several* limits at once — every bucket must yield a token before a
+    request proceeds — e.g. WikiArt's "4/s **and** 400/hour":
+    ``RateLimiter(buckets=[TokenBucket(4, 4), TokenBucket(400/3600, 400)])``.
+    """
+
+    def __init__(self, requests_per_second: float = None, burst: int = None,
+                 max_concurrency: int = 4, *, buckets=None):
+        if buckets is None:
+            if requests_per_second is None or burst is None:
+                raise ValueError("provide requests_per_second+burst, or buckets")
+            buckets = [TokenBucket(requests_per_second, burst)]
+        self._buckets = list(buckets)
         self._sem = asyncio.Semaphore(max(1, max_concurrency))
 
     async def __aenter__(self):
         await self._sem.acquire()
         try:
-            await self._bucket.acquire()
+            # Satisfy every limit. Acquiring in series is fine: a bucket consumes
+            # a token only when it grants, so a later bucket's wait can't waste an
+            # earlier token (the earlier token is already "spent" on this request).
+            for bucket in self._buckets:
+                await bucket.acquire()
         except BaseException:
             self._sem.release()
             raise

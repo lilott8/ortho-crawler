@@ -9,6 +9,7 @@ source, not a per-record signal worth threading through a gate.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from typing import AsyncIterator, List, Optional, Tuple
 import aiohttp
 
 from config import SaintsConfig
+from icon_sources import _HttpJson
 from ratelimit import RateLimiter
 
 log = logging.getLogger("ortho_scraper.saint_sources")
@@ -67,16 +69,12 @@ def _parse_month_day(label: str):
     return None
 
 
-async def _wbget(qid: str, props: str, session: aiohttp.ClientSession,
-                 limiter: RateLimiter):
+async def _wbget(qid: str, props: str, http: _HttpJson):
     try:
-        async with limiter:
-            async with session.get(WIKIDATA_API_URL, params={
-                "action": "wbgetentities", "ids": qid, "props": props,
-                "languages": "en", "format": "json"}) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-    except aiohttp.ClientError as exc:
+        data = await http.get(WIKIDATA_API_URL, {
+            "action": "wbgetentities", "ids": qid, "props": props,
+            "languages": "en", "format": "json"})
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         log.debug("[saints] wbgetentities(%s, %s) failed: %s", qid, props, exc)
         return None
     if "error" in data:
@@ -84,8 +82,7 @@ async def _wbget(qid: str, props: str, session: aiohttp.ClientSession,
     return (data.get("entities") or {}).get(qid)
 
 
-async def fetch_wikidata_facts(qid: str, session: aiohttp.ClientSession,
-                               limiter: RateLimiter):
+async def fetch_wikidata_facts(qid: str, http: _HttpJson):
     """(aliases, feast_day_qids, description) for a saint QID — one wbgetentities call.
 
     Aliases feed the multi-valued ``alt_names`` field; every P841 value (a saint
@@ -93,7 +90,7 @@ async def fetch_wikidata_facts(qid: str, session: aiohttp.ClientSession,
     separately (and cached); the CC0 description is a core-data one-liner. All are
     uncopyrightable. Returns ([], [], None) on any failure.
     """
-    ent = await _wbget(qid, "aliases|claims|descriptions", session, limiter)
+    ent = await _wbget(qid, "aliases|claims|descriptions", http)
     if ent is None:
         return [], [], None
     aliases, seen = [], set()
@@ -113,13 +110,12 @@ async def fetch_wikidata_facts(qid: str, session: aiohttp.ClientSession,
     return aliases, feast_qids, description
 
 
-async def resolve_feast_md(day_qid: str, session: aiohttp.ClientSession,
-                           limiter: RateLimiter, cache: dict):
+async def resolve_feast_md(day_qid: str, http: _HttpJson, cache: dict):
     """Resolve a calendar-day item QID to MM-DD, memoized per run (many saints
     share the same feast day)."""
     if day_qid in cache:
         return cache[day_qid]
-    ent = await _wbget(day_qid, "labels", session, limiter)
+    ent = await _wbget(day_qid, "labels", http)
     label = ((ent or {}).get("labels", {}).get("en", {}) or {}).get("value")
     md = _parse_month_day(label)
     cache[day_qid] = md
@@ -148,23 +144,19 @@ _SKIP_PREFIXES = ("Category:", "File:", "Template:", "Help:", "Portal:",
                    "Wikipedia:", "Talk:", "List of")
 
 
-async def fetch_saint_names(cfg: SaintsConfig, session: aiohttp.ClientSession,
-                             limiter: RateLimiter) -> AsyncIterator[Tuple[str, str]]:
+async def fetch_saint_names(cfg: SaintsConfig, http: _HttpJson) -> AsyncIterator[Tuple[str, str]]:
     """Yield (canonical_name, display_name) pairs from the configured list articles."""
     emitted = 0
     for page_title in cfg.wikipedia_articles:
         try:
-            async with limiter:
-                async with session.get(WIKIPEDIA_API_URL, params={
-                    "action": "parse",
-                    "page": page_title,
-                    "prop": "wikitext",
-                    "format": "json",
-                    "formatversion": "2",
-                }) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-        except aiohttp.ClientError as exc:
+            data = await http.get(WIKIPEDIA_API_URL, {
+                "action": "parse",
+                "page": page_title,
+                "prop": "wikitext",
+                "format": "json",
+                "formatversion": "2",
+            })
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # One bad/missing article shouldn't sink the others.
             log.warning("[saints] skipping %r: %s", page_title, exc)
             continue
@@ -198,24 +190,22 @@ async def fetch_saint_records(cfg: SaintsConfig, session: aiohttp.ClientSession,
     a ``qid_overrides`` correction (display title -> QID) supplies one.
     """
     qid_overrides = qid_overrides or {}
+    http = _HttpJson(session, limiter)
     feast_cache: dict = {}    # day-item QID -> MM-DD, shared across the roster
-    async for target, _display in fetch_saint_names(cfg, session, limiter):
+    async for target, _display in fetch_saint_names(cfg, http):
         try:
-            async with limiter:
-                async with session.get(WIKIPEDIA_API_URL, params={
-                    "action": "query",
-                    "prop": "extracts|pageprops",
-                    "titles": target,
-                    "exintro": "1",
-                    "explaintext": "1",
-                    "ppprop": "wikibase_item",
-                    "redirects": "1",
-                    "format": "json",
-                    "formatversion": "2",
-                }) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-        except aiohttp.ClientError as exc:
+            data = await http.get(WIKIPEDIA_API_URL, {
+                "action": "query",
+                "prop": "extracts|pageprops",
+                "titles": target,
+                "exintro": "1",
+                "explaintext": "1",
+                "ppprop": "wikibase_item",
+                "redirects": "1",
+                "format": "json",
+                "formatversion": "2",
+            })
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             log.warning("[saints] skipping %r: %s", target, exc)
             continue
         if "error" in data:  # missing page returns 200 + error object, not a 4xx
@@ -242,10 +232,10 @@ async def fetch_saint_records(cfg: SaintsConfig, session: aiohttp.ClientSession,
             else:
                 log.debug("[saints] %r has no Wikidata QID -> needs-review.", title)
         alt_names, feast_qids, description = (
-            await fetch_wikidata_facts(qid, session, limiter) if qid else ([], [], None))
+            await fetch_wikidata_facts(qid, http) if qid else ([], [], None))
         feast_days = []
         for fq in feast_qids:
-            md = await resolve_feast_md(fq, session, limiter, feast_cache)
+            md = await resolve_feast_md(fq, http, feast_cache)
             if md and md not in feast_days:
                 feast_days.append(md)
         yield SaintRecord(

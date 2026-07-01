@@ -20,7 +20,7 @@ import aiohttp
 from config import load_config, parse_duration, select_policy
 from storage import CURATED_WEIGHT, create_storage
 from mediawiki import MediaWikiClient
-from ratelimit import RateLimiter
+from ratelimit import RateLimiter, TokenBucket
 from scraper import Scraper
 from icon_pipeline import IconPipeline
 from notifications import run_daily_notifications
@@ -85,14 +85,26 @@ async def run_icons(config, db) -> None:
     timeout = aiohttp.ClientTimeout(total=ic.http.timeout)
     # Reuse the wiki scraper's User-Agent for a polite, identifying contact.
     headers = {"User-Agent": config.scraper.user_agent}
-    limiter = RateLimiter(
-        requests_per_second=ic.rate_limit.requests_per_second,
-        burst=ic.rate_limit.burst,
-        max_concurrency=ic.rate_limit.max_concurrency,
-    )
+    # One limiter per source so a tight budget (WikiArt 400/hr) never throttles
+    # the others; a multi-bucket limiter enforces requests/sec AND requests/hour.
+    source_limiters = {name: _build_limiter(sc) for name, sc in ic.sources.items()}
+    default_limiter = _build_limiter_from(ic.rate_limit, 0)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        pipeline = IconPipeline(config, session, db).with_limiter(limiter)
+        pipeline = IconPipeline(config, session, db).with_limiters(
+            source_limiters, default_limiter)
         await pipeline.run()
+
+
+def _build_limiter(sc) -> RateLimiter:
+    return _build_limiter_from(sc.rate_limit, sc.hourly_cap)
+
+
+def _build_limiter_from(rl, hourly_cap: int) -> RateLimiter:
+    buckets = [TokenBucket(rl.requests_per_second, rl.burst)]
+    if hourly_cap > 0:
+        # Second bucket: ~cap/3600 per second, capacity = the hourly cap itself.
+        buckets.append(TokenBucket(hourly_cap / 3600.0, hourly_cap))
+    return RateLimiter(buckets=buckets, max_concurrency=rl.max_concurrency)
 
 
 async def run_notify(config, db) -> None:
@@ -112,7 +124,9 @@ async def run_saints(config, db) -> None:
         return
     corr = config.corrections
     headers = {"User-Agent": config.scraper.user_agent}
-    limiter = RateLimiter(requests_per_second=1.0, burst=2, max_concurrency=1)
+    rl = sc.rate_limit
+    limiter = RateLimiter(requests_per_second=rl.requests_per_second, burst=rl.burst,
+                          max_concurrency=rl.max_concurrency)
 
     # Wikipedia is a blanket CC BY-SA source (no per-item licensing); register it
     # so bio claims carry a source_id. `curated` carries operator corrections.
@@ -139,44 +153,47 @@ async def run_saints(config, db) -> None:
         async for rec in fetch_saint_records(sc, session, limiter,
                                              qid_overrides=corr.saint_qid):
             stats.seen += 1
-            if rec.qid:
-                stats.resolved += 1
-                if rec.qid_from_correction:
-                    stats.rescued += 1
-                saint_id = await db.upsert_saint_by_qid(rec.qid, rec.display_name)
-            else:
-                stats.needs_review += 1
-                saint_id = await db.upsert_saint(rec.display_name)  # qid stays NULL
-            if rec.bio_text:
-                lic, attr = rec.license, rec.attribution
-                if policy and policy.decision == "rejected":
-                    lic = None                       # stored for audit, not servable
-                elif policy and policy.decision == "approved":
-                    lic = policy.license or rec.license
-                    attr = policy.attribution or rec.attribution
-                await db.add_claim(saint_id, "bio", rec.bio_text, src.source_id,
-                                   sc.wikipedia_weight, lic, attr)
-                stats.bio += 1
-            if rec.qid:
-                # Replace this source's sets (empty list clears stale values).
-                # alt_names/feast_days/description are core-data facts -> no license
-                # (description carries CC0 for provenance).
-                await db.set_claims(saint_id, "alt_names", rec.alt_names,
-                                    src.source_id, sc.wikipedia_weight, None, None)
-                await db.set_claims(saint_id, "feast_day", rec.feast_days,
-                                    src.source_id, sc.wikipedia_weight, None, None)
-                stats.aliases += len(rec.alt_names)
-                stats.feasts += len(rec.feast_days)
-                if rec.description:
-                    await db.add_claim(saint_id, "description", rec.description,
-                                       src.source_id, sc.wikipedia_weight, "CC0", None)
-                    stats.descriptions += 1
-            await db.recompute_saint(saint_id)
-            log.info("[saints %d] %-40s | qid=%-9s bio=%s feast=%d alias=%d desc=%s%s",
-                     stats.seen, rec.display_name[:40], rec.qid or "—",
-                     "y" if rec.bio_text else "—", len(rec.feast_days),
-                     len(rec.alt_names), "y" if rec.description else "—",
-                     "  [rescued]" if rec.qid_from_correction else "")
+            try:
+                if rec.qid:
+                    stats.resolved += 1
+                    if rec.qid_from_correction:
+                        stats.rescued += 1
+                    saint_id = await db.upsert_saint_by_qid(rec.qid, rec.display_name)
+                else:
+                    stats.needs_review += 1
+                    saint_id = await db.upsert_saint(rec.display_name)  # qid stays NULL
+                if rec.bio_text:
+                    lic, attr = rec.license, rec.attribution
+                    if policy and policy.decision == "rejected":
+                        lic = None                   # stored for audit, not servable
+                    elif policy and policy.decision == "approved":
+                        lic = policy.license or rec.license
+                        attr = policy.attribution or rec.attribution
+                    await db.add_claim(saint_id, "bio", rec.bio_text, src.source_id,
+                                       sc.wikipedia_weight, lic, attr)
+                    stats.bio += 1
+                if rec.qid:
+                    # Replace this source's sets (empty list clears stale values).
+                    # alt_names/feast_days/description are core-data facts -> no license
+                    # (description carries CC0 for provenance).
+                    await db.set_claims(saint_id, "alt_names", rec.alt_names,
+                                        src.source_id, sc.wikipedia_weight, None, None)
+                    await db.set_claims(saint_id, "feast_day", rec.feast_days,
+                                        src.source_id, sc.wikipedia_weight, None, None)
+                    stats.aliases += len(rec.alt_names)
+                    stats.feasts += len(rec.feast_days)
+                    if rec.description:
+                        await db.add_claim(saint_id, "description", rec.description,
+                                           src.source_id, sc.wikipedia_weight, "CC0", None)
+                        stats.descriptions += 1
+                await db.recompute_saint(saint_id)
+                log.info("[saints %d] %-40s | qid=%-9s bio=%s feast=%d alias=%d desc=%s%s",
+                         stats.seen, rec.display_name[:40], rec.qid or "—",
+                         "y" if rec.bio_text else "—", len(rec.feast_days),
+                         len(rec.alt_names), "y" if rec.description else "—",
+                         "  [rescued]" if rec.qid_from_correction else "")
+            except Exception as exc:  # noqa: BLE001 - one bad saint must not sink the run
+                log.warning("[saints] skipping %r after error: %s", rec.display_name, exc)
 
     log.info("[saints] Wikipedia phase: %d processed | %d bio, %d alias, %d feast, "
              "%d desc | %d needs-review (%d rescued by correction).",
@@ -242,11 +259,15 @@ async def _enrich_from_orthodoxwiki(config, db, stats=None) -> None:
              len(pages))
 
     headers = {"User-Agent": config.scraper.user_agent}
-    limiter = RateLimiter(requests_per_second=1.0, burst=2, max_concurrency=1)
+    rl = sc.rate_limit
+    limiter = RateLimiter(requests_per_second=rl.requests_per_second, burst=rl.burst,
+                          max_concurrency=rl.max_concurrency)
     matched = by_override = by_name = by_qid = 0
+    total = len(pages)
+    started = time.monotonic()
     async with aiohttp.ClientSession(headers=headers) as session:
         http = _HttpJson(session, limiter)
-        for p in pages:
+        for i, p in enumerate(pages, 1):
             via, saint_id = "override", qid_index.get(corr.owiki_qid.get(p["title"], ""))
             if saint_id is None:
                 via, saint_id = "name", name_index.get(normalize_name(p["title"]))
@@ -259,24 +280,49 @@ async def _enrich_from_orthodoxwiki(config, db, stats=None) -> None:
                     qid = None
                 if qid:
                     via, saint_id = "qid", qid_index.get(qid)
-            if saint_id is None:
-                continue
-            lead = clean_wikitext_lead(p["content"])
-            if not lead:
-                continue
-            attribution = p.get("attribution") or f"OrthodoxWiki, {ORTHODOXWIKI_LICENSE}"
-            await db.add_claim(saint_id, "bio", lead, owiki.source_id,
-                               sc.orthodoxwiki_weight, ORTHODOXWIKI_LICENSE, attribution)
-            await db.recompute_saint(saint_id)
-            matched += 1
-            by_override += via == "override"
-            by_name += via == "name"
-            by_qid += via == "qid"
-            log.debug("[owiki] %r -> saint %d (%s)", p["title"], saint_id, via)
+            if saint_id is not None:
+                lead = clean_wikitext_lead(p["content"])
+                if lead:
+                    attribution = p.get("attribution") or f"OrthodoxWiki, {ORTHODOXWIKI_LICENSE}"
+                    await db.add_claim(saint_id, "bio", lead, owiki.source_id,
+                                       sc.orthodoxwiki_weight, ORTHODOXWIKI_LICENSE, attribution)
+                    await db.recompute_saint(saint_id)
+                    matched += 1
+                    by_override += via == "override"
+                    by_name += via == "name"
+                    by_qid += via == "qid"
+                    log.debug("[owiki] %r -> saint %d (%s)", p["title"], saint_id, via)
+            # Periodic progress: this loop is network-bound (a rate-limited QID
+            # resolve per name-miss) and can run for minutes with most pages
+            # matching nothing, so silence here reads as a hang.
+            if i % 25 == 0 or i == total:
+                elapsed = time.monotonic() - started
+                pct = 100.0 * i / total if total else 100.0
+                log.info("[owiki %d/%d %4.1f%%] %d matched so far "
+                         "(%d override, %d name, %d QID) in %.0fs.",
+                         i, total, pct, matched, by_override, by_name, by_qid, elapsed)
     if stats is not None:
         stats.owiki_bio = matched
     log.info("[saints] OrthodoxWiki: %d matched (%d override, %d name, %d QID) of %d.",
              matched, by_override, by_name, by_qid, len(pages))
+
+
+async def run_enrich(config, db) -> None:
+    """OrthodoxWiki enrichment only, skipping the Wikipedia ingest phase.
+
+    Reuses saints and pages already in the DB from prior `--mode saints` /
+    `--mode wiki` runs; needs no HTTP unless a name-miss requires a QID resolve.
+    Useful for re-running enrichment after a fresh `--mode wiki` crawl without
+    re-fetching the Wikipedia roster.
+    """
+    sc = config.saints
+    if not sc.enabled:
+        log.warning("saints.enabled is false in the config; nothing to enrich.")
+        return
+    if sc.orthodoxwiki_weight <= 0:
+        log.warning("saints.orthodoxwiki_weight is 0; enrichment is disabled.")
+        return
+    await _enrich_from_orthodoxwiki(config, db)
 
 
 async def run_stats(config, db) -> None:
@@ -338,10 +384,13 @@ def _print_correction_stubs(saint_names, owiki_titles) -> None:
 
 # Canonical order: scrape, then ingest icons, then saints, then notify.
 _MODES = {"wiki": run_wiki, "icons": run_icons, "saints": run_saints,
-          "notify": run_notify, "stats": run_stats, "review": run_review}
+          "enrich": run_enrich, "notify": run_notify, "stats": run_stats,
+          "review": run_review}
 
-# Read-only report modes, excluded from an 'all' ingest run.
-_REPORT_MODES = {"stats", "review"}
+# Modes excluded from an 'all' ingest run: read-only reports (stats, review),
+# plus 'enrich', which 'saints' already runs internally when
+# orthodoxwiki_weight > 0 — including it in 'all' would just redo that work.
+_EXCLUDED_FROM_ALL = {"stats", "review", "enrich"}
 
 
 def resolve_modes(selected) -> list:
@@ -349,7 +398,7 @@ def resolve_modes(selected) -> list:
     if not selected:
         return ["wiki"]
     if "all" in selected:
-        return [m for m in _MODES if m not in _REPORT_MODES]
+        return [m for m in _MODES if m not in _EXCLUDED_FROM_ALL]
     return [m for m in _MODES if m in selected]
 
 
@@ -365,6 +414,7 @@ async def run_once(config, modes: list) -> None:
 
 async def main_async(args) -> int:
     config = load_config(args.config)
+    config.icons.force_recrawl = bool(args.force_recrawl)
     modes = resolve_modes(args.mode)
     label = "+".join(modes)
 
@@ -394,12 +444,19 @@ def main() -> int:
                         help="What to run; repeatable (e.g. --mode wiki --mode icons). "
                              "'wiki' (OrthodoxWiki scraper, default), 'icons' (licensed "
                              "icon/saints ingestion), 'saints' (Wikipedia saint-name "
-                             "roster, no icons/licensing), 'notify' (daily follower "
-                             "notifications), or 'all'. Runs in order: wiki, icons, "
-                             "saints, notify.")
+                             "roster + OrthodoxWiki enrichment, no icons/licensing), "
+                             "'enrich' (OrthodoxWiki enrichment only, skipping the "
+                             "Wikipedia ingest phase — reuses saints/pages already in "
+                             "the DB), 'notify' (daily follower notifications), or "
+                             "'all'. Runs in order: wiki, icons, saints, notify ('all' "
+                             "excludes 'enrich', already covered by 'saints').")
     parser.add_argument("--loop", metavar="DURATION", default=None,
                         help="Run continuously, sleeping this long between passes "
                              "(e.g. '6h', '30 minutes'). Default: run once and exit.")
+    parser.add_argument("--force-recrawl", action="store_true",
+                        help="Icons: ignore icons.recrawl_after and re-fetch every "
+                             "discovered record this run (conditional GET still "
+                             "skips unchanged bytes).")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging.")
     args = parser.parse_args()

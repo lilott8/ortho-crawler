@@ -17,6 +17,8 @@ Sources (see PRD §2):
   * ``iconsaint`` — local copy of the ICONSAINT GitHub dataset (blanket CC BY,
     images-only). Read from a configured ``dataset_path`` so the required
     human license check happens before bytes are pointed at the pipeline.
+  * ``openverse`` — Openverse aggregated image search (anonymous access), a
+    per-file ``license`` code checked against the source's allowed_licenses.
 """
 
 from __future__ import annotations
@@ -40,6 +42,9 @@ log = logging.getLogger("ortho_scraper.icon_sources")
 MET_SEARCH_URL = "https://collectionapi.metmuseum.org/public/collection/v1/search"
 MET_OBJECT_URL = "https://collectionapi.metmuseum.org/public/collection/v1/objects/{id}"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+WIKIART_SEARCH_URL = "https://www.wikiart.org/en/api/2/PaintingSearch"
+OPENVERSE_SEARCH_URL = "https://api.openverse.org/v1/images/"
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff", ".webp", ".bmp"}
 
@@ -72,10 +77,16 @@ class RawRecord:
 
     Exactly one image origin is set: ``image_url`` (download) or
     ``local_source_path`` (copy an already-local file, e.g. ICONSAINT).
+
+    ``uri`` is the stable identity of this rendition within its source — the
+    image URL for HTTP sources, the relative dataset path for local ones. With
+    ``source`` it forms the icon's ``(source, uri)`` key (last-write-wins). Every
+    adapter MUST set it.
     """
     source: str
     source_record_id: str
     title: str
+    uri: str = ""
     saint_name: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
@@ -186,6 +197,7 @@ class MetAdapter(SourceAdapter):
                     source=self.name,
                     source_record_id=str(obj.get("objectID", oid)),
                     title=title,
+                    uri=image,                            # image URL = rendition identity
                     saint_name=guess_saint_name(title),   # low-trust hint, link-only
                     description=obj.get("objectName") or obj.get("medium"),
                     image_url=image,
@@ -253,6 +265,7 @@ class WikimediaAdapter(SourceAdapter):
                         source=self.name,
                         source_record_id=str(page.get("pageid") or title),
                         title=title,
+                        uri=ii.get("url"),                    # file URL = rendition identity
                         saint_name=guess_saint_name(title),   # low-trust hint, link-only
                         description=(ext.get("ImageDescription", {}) or {}).get("value"),
                         image_url=ii.get("url"),
@@ -266,6 +279,180 @@ class WikimediaAdapter(SourceAdapter):
                 if not cont:
                     break
         log.info("[wikimedia] emitted %d record(s).", emitted)
+
+
+class WikipediaCategoryAdapter(SourceAdapter):
+    """English Wikipedia category — articles about icons, one icon each.
+
+    Walks the configured category's article members (recursing subcategories up
+    to ``subcat_depth``), takes each article's **lead image** (``pageimages`` —
+    the icon for an icon article, far less noise than every image on the page),
+    then fetches per-file Commons license metadata (``imageinfo`` extmetadata).
+    The article title ("Theotokos of Vladimir") is a strong saint hint.
+
+    The images are Commons-hosted with per-file license tags, so the gate runs
+    the same Commons check (``license_gate`` routes 'wikipedia' there). Locally
+    uploaded fair-use files carry non-free tags absent from ``allowed_licenses``
+    and quarantine, fail-closed.
+    """
+
+    name = "wikipedia"
+
+    def __init__(self, cfg: IconSourceConfig, http: _HttpJson):
+        self._cfg = cfg
+        self._http = http
+
+    async def records(self) -> AsyncIterator[RawRecord]:
+        category = self._cfg.category or "Category:Eastern Orthodox icons"
+        # file_title (with "File:" prefix) -> article title (the saint hint).
+        lead: Dict[str, str] = {}
+        await self._collect(category, self._cfg.subcat_depth, lead, set())
+        log.info("[wikipedia] %s -> %d candidate lead image(s).", category, len(lead))
+
+        emitted = 0
+        file_titles = list(lead)
+        for i in range(0, len(file_titles), 50):
+            if emitted >= self._cfg.max_files:
+                break
+            batch = file_titles[i:i + 50]
+            data = await self._http.get(WIKIPEDIA_API_URL, {
+                "action": "query", "format": "json", "formatversion": "2",
+                "titles": "|".join(batch),
+                "prop": "imageinfo", "iiprop": "url|mime|extmetadata",
+            })
+            for page in data.get("query", {}).get("pages", []):
+                if emitted >= self._cfg.max_files:
+                    break
+                infos = page.get("imageinfo") or []
+                if not infos:
+                    continue
+                ii = infos[0]
+                url = ii.get("url")
+                if not url:
+                    continue
+                ext = ii.get("extmetadata", {}) or {}
+                article = lead.get(page.get("title"))
+                emitted += 1
+                yield RawRecord(
+                    source=self.name,
+                    source_record_id=page.get("title"),     # File:… title, stable
+                    title=article or page.get("title"),
+                    uri=url,                                 # Commons image URL = identity
+                    saint_name=article,                      # article title: strong, link-only hint
+                    description=(ext.get("ImageDescription", {}) or {}).get("value"),
+                    image_url=url,
+                    license_signal={
+                        "license_short": (ext.get("LicenseShortName", {}) or {}).get("value"),
+                        "author": _strip_html((ext.get("Artist", {}) or {}).get("value")),
+                    },
+                    raw=page,
+                )
+        log.info("[wikipedia] emitted %d record(s).", emitted)
+
+    async def _collect(self, category: str, depth: int,
+                       lead: Dict[str, str], seen_cats: set) -> None:
+        """BFS the category: collect article lead images, recurse subcats to depth."""
+        cont: Dict[str, str] = {}
+        while len(lead) < self._cfg.max_files:
+            data = await self._http.get(WIKIPEDIA_API_URL, {
+                "action": "query", "format": "json", "formatversion": "2",
+                "generator": "categorymembers", "gcmtitle": category,
+                "gcmtype": "page", "gcmlimit": "50",
+                "prop": "pageimages", "piprop": "name", **cont,
+            })
+            for p in data.get("query", {}).get("pages", []):
+                pi = p.get("pageimage")
+                if not pi:
+                    continue
+                ft = pi if pi.startswith("File:") else f"File:{pi}"
+                # imageinfo returns titles with spaces; normalize so the later
+                # File:title -> article lookup matches (pageimage uses underscores).
+                ft = ft.replace("_", " ")
+                lead.setdefault(ft, p.get("title"))
+            cont = data.get("continue", {})
+            if not cont:
+                break
+        if depth <= 0:
+            return
+        subcont: Dict[str, str] = {}
+        while True:
+            data = await self._http.get(WIKIPEDIA_API_URL, {
+                "action": "query", "format": "json", "formatversion": "2",
+                "list": "categorymembers", "cmtitle": category,
+                "cmtype": "subcat", "cmlimit": "50", **subcont,
+            })
+            for m in data.get("query", {}).get("categorymembers", []):
+                title = m.get("title")
+                if not title or title in seen_cats:
+                    continue
+                seen_cats.add(title)
+                await self._collect(title, depth - 1, lead, seen_cats)
+            subcont = data.get("continue", {})
+            if not subcont:
+                break
+
+
+class WikiArtAdapter(SourceAdapter):
+    """WikiArt: paginated painting search.
+
+    Crawls *all* matching works (the gate filters; read side serves only
+    'approved'). WikiArt's licensing is murky and its API does not expose a clean
+    per-image redistribution license, so the gate is fail-closed (see
+    ``license_gate._check_wikiart``) — everything quarantines until a positive
+    signal or override clears it.
+
+    ponytail: the exact API response shape is **unverified** (no account/key on
+    hand at build time). The request/paginate flow follows WikiArt's documented
+    PaintingSearch; field reads are defensive and any error skips the item rather
+    than killing the run. Tighten field mapping once a live key is available.
+    """
+
+    name = "wikiart"
+
+    def __init__(self, cfg: IconSourceConfig, http: _HttpJson):
+        self._cfg = cfg
+        self._http = http
+
+    async def records(self) -> AsyncIterator[RawRecord]:
+        if not self._cfg.api_key:
+            log.warning("[wikiart] api_key not set (export WIKIART_API_KEY); skipping.")
+            return
+        terms = self._cfg.queries or ["icon"]
+        seen: set = set()
+        emitted = 0
+        for term in terms:
+            token: Optional[str] = None
+            while emitted < self._cfg.max_objects:
+                params = {"term": term, "json": "2", "authSessionKey": self._cfg.api_key}
+                if token:
+                    params["paginationToken"] = token
+                data = await self._http.get(WIKIART_SEARCH_URL, params)
+                items = data.get("data") or []
+                for it in items:
+                    if emitted >= self._cfg.max_objects:
+                        break
+                    image = it.get("image")
+                    rec_id = str(it.get("id") or it.get("url") or "")
+                    if not image or not rec_id or rec_id in seen:
+                        continue
+                    seen.add(rec_id)
+                    emitted += 1
+                    title = it.get("title") or f"WikiArt {rec_id}"
+                    yield RawRecord(
+                        source=self.name,
+                        source_record_id=rec_id,
+                        title=title,
+                        uri=image,                            # image URL = rendition identity
+                        saint_name=guess_saint_name(title),   # low-trust hint, link-only
+                        description=it.get("artistName"),
+                        image_url=image,
+                        license_signal={"author": it.get("artistName") or None},
+                        raw=it,
+                    )
+                token = data.get("paginationToken")
+                if not token or not data.get("hasMore"):
+                    break
+        log.info("[wikiart] emitted %d record(s).", emitted)
 
 
 class IconsaintAdapter(SourceAdapter):
@@ -343,12 +530,96 @@ class IconsaintAdapter(SourceAdapter):
             source=self.name,
             source_record_id=rel,                       # stable id within the dataset
             title=os.path.splitext(os.path.basename(img_path))[0].replace("_", " "),
+            uri=rel,                                    # relative path = rendition identity
             saint_name=saint,
             description=None,
             local_source_path=img_path,
             license_signal={},                          # source-level grant
             raw=raw,
         )
+
+
+class OpenverseAdapter(SourceAdapter):
+    """Openverse: aggregated openly-licensed image search (anonymous access).
+
+    Openverse has no icon-specific taxonomy — it's free-text search over
+    metadata aggregated from many providers (Wikimedia Commons, Flickr, museum
+    collections, etc.), so scope comes entirely from the configured query terms
+    (``queries``, e.g. "Byzantine icon", "Orthodox icon"). ``allowed_licenses``
+    is passed to the API as a ``license=`` filter (saves crawl budget) AND still
+    checked by the gate (defense in depth, as with the Wikimedia adapter).
+
+    Each result already carries a ready-made ``attribution`` string built from
+    the original creator/license/source, which the gate uses as the default
+    attribution rather than resynthesizing one.
+    """
+
+    name = "openverse"
+
+    def __init__(self, cfg: IconSourceConfig, http: _HttpJson):
+        self._cfg = cfg
+        self._http = http
+
+    async def records(self) -> AsyncIterator[RawRecord]:
+        terms = self._cfg.queries or ["Byzantine icon"]
+        license_param = ",".join(self._cfg.allowed_licenses) or None
+        seen: set = set()
+        emitted = 0
+        for term in terms:
+            if emitted >= self._cfg.max_objects:
+                break
+            before = emitted
+            page = 1
+            while emitted < self._cfg.max_objects:
+                params = {
+                    "q": term,
+                    "page": page,
+                    "page_size": 20,
+                    "filter_dead": str(self._cfg.filter_dead).lower(),
+                    "mature": str(self._cfg.mature).lower(),
+                }
+                if license_param:
+                    params["license"] = license_param
+                try:
+                    data = await self._http.get(OPENVERSE_SEARCH_URL, params)
+                except aiohttp.ClientError as exc:
+                    # Permanent (4xx) or retry-exhausted (5xx, already warned by
+                    # _HttpJson): skip the rest of this term, not the whole crawl.
+                    log.warning("[openverse] query %r page %d failed: %s", term, page, exc)
+                    break
+                results = data.get("results") or []
+                if not results:
+                    break
+                for item in results:
+                    if emitted >= self._cfg.max_objects:
+                        break
+                    rec_id = item.get("id")
+                    url = item.get("url")
+                    if not rec_id or not url or rec_id in seen:
+                        continue
+                    seen.add(rec_id)
+                    emitted += 1
+                    title = item.get("title") or f"Openverse {rec_id}"
+                    yield RawRecord(
+                        source=self.name,
+                        source_record_id=str(rec_id),
+                        title=title,
+                        uri=url,                              # image URL = rendition identity
+                        saint_name=guess_saint_name(title),   # low-trust hint, link-only
+                        description=item.get("foreign_landing_url"),
+                        image_url=url,
+                        license_signal={
+                            "license": item.get("license"),
+                            "attribution": item.get("attribution"),
+                            "author": item.get("creator") or None,
+                        },
+                        raw=item,
+                    )
+                if page >= int(data.get("page_count") or 0):
+                    break
+                page += 1
+            log.info("[openverse] query %r -> %d result(s).", term, emitted - before)
+        log.info("[openverse] emitted %d record(s) total.", emitted)
 
 
 def _strip_html(value: Optional[str]) -> Optional[str]:
@@ -361,17 +632,29 @@ def _strip_html(value: Optional[str]) -> Optional[str]:
     return text or None
 
 
-def build_adapters(sources: Dict[str, IconSourceConfig], http: _HttpJson) -> List[SourceAdapter]:
-    """Instantiate the enabled adapters in a stable order."""
+def build_adapters(sources: Dict[str, IconSourceConfig],
+                   http_for: Dict[str, _HttpJson]) -> List[SourceAdapter]:
+    """Instantiate the enabled adapters in a stable order.
+
+    ``http_for`` maps a source name to its own rate-limited HTTP client (each
+    source has its own limiter, so a tight budget doesn't throttle the others).
+    """
     adapters: List[SourceAdapter] = []
-    for name in ("met_api", "wikimedia", "iconsaint"):
+    for name in ("met_api", "wikimedia", "wikipedia", "wikiart", "openverse", "iconsaint"):
         cfg = sources.get(name)
         if not cfg or not cfg.enabled:
             continue
+        http = http_for.get(name)
         if name == "met_api":
             adapters.append(MetAdapter(cfg, http))
         elif name == "wikimedia":
             adapters.append(WikimediaAdapter(cfg, http))
+        elif name == "wikipedia":
+            adapters.append(WikipediaCategoryAdapter(cfg, http))
+        elif name == "wikiart":
+            adapters.append(WikiArtAdapter(cfg, http))
+        elif name == "openverse":
+            adapters.append(OpenverseAdapter(cfg, http))
         elif name == "iconsaint":
             adapters.append(IconsaintAdapter(cfg))
     return adapters

@@ -92,11 +92,29 @@ class LicenseGate:
         """Dispatch to the per-source classifier. Unknown source → rejected."""
         if source.name == "met_api":
             return self._check_met(source, record)
-        if source.name == "wikimedia":
+        # Wikipedia-category images are Commons-hosted with the same per-file
+        # extmetadata license tags, so the Commons check applies verbatim.
+        if source.name in ("wikimedia", "wikipedia"):
             return self._check_wikimedia(source, record)
+        if source.name == "wikiart":
+            return self._check_wikiart(source, record)
         if source.name == "iconsaint":
             return self._check_iconsaint(source, record)
+        if source.name == "openverse":
+            return self._check_openverse(source, record)
         return GateResult(status=REJECTED, reason="unknown_source")
+
+    # -- WikiArt: stub — fail-closed until the license signal is known. ---------
+    def _check_wikiart(self, source: Source, record) -> GateResult:
+        # ponytail: stub. No API access yet to learn WikiArt's license/date fields,
+        # and its terms disclaim copyright (mostly in-copyright / fair-use). So
+        # everything quarantines: the adapter still crawls all records, the read
+        # side serves only 'approved', and items are promoted via license_overrides
+        # / per-source policy. When a positive signal exists (e.g. artist
+        # death-year + 70 < now, or a PD flag), add the auto-approve path here —
+        # mirror _check_met's is_public_domain shape and return APPROVED with a
+        # rendered attribution.
+        return GateResult(status=QUARANTINED, reason="wikiart_license_unverified")
 
     # -- Met Open Access: public domain per-object; never bulk-assume. ---------
     def _check_met(self, source: Source, record) -> GateResult:
@@ -152,3 +170,23 @@ class LicenseGate:
         )
         return GateResult(status=APPROVED, license=source.base_license,
                           attribution=attribution)
+
+    # -- Openverse: per-record license code against the allowlist. -------------
+    def _check_openverse(self, source: Source, record) -> GateResult:
+        lic = record.license_signal.get("license")
+        if lic and lic in source.allowed_licenses:
+            # Openverse always builds a correctly-sourced attribution string
+            # (creator/license/original source) for every result; prefer it over
+            # a synthesized default, but still let attribution_template override.
+            attribution = _render_attribution(
+                source.attribution_template,
+                default=record.license_signal.get("attribution"),
+                author=record.license_signal.get("author"),
+                license=lic,
+                source="Openverse",
+                source_record_id=record.source_record_id,
+                title=record.title,
+            )
+            return GateResult(status=APPROVED, license=lic, attribution=attribution)
+        return GateResult(status=QUARANTINED,
+                          reason=f"unrecognized_or_restrictive_license:{lic or 'none'}")
